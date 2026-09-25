@@ -1,0 +1,20 @@
+# Данные — они большие и могут быть чувствительными
+data/raw/
+data/interim/
+data/processed/
+
+# Результаты запусков
+results/
+logs/
+
+# Системные
+__pycache__/
+*.pyc
+.vscode/
+.pytest_cache/
+
+# Файлы настроек конкретного пользователя (если будут)
+*.local.yaml
+
+# Файлы Excel, если открыты
+~$*.xlsx
