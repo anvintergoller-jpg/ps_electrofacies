@@ -12,34 +12,44 @@
 """
 
 from pathlib import Path
+import pandas as pd
 
 import matplotlib.pyplot as plt
 
 
-# Цвета для интервалов
-RESERVOIR_COLOR = "#4CAF50"       # зелёный
-NON_RESERVOIR_COLOR = "#E0E0E0"   # светло-серый
+# Импортируем цвета форм из легенды — единая палитра для проекта.
+from src.visualization.form_legend import FORM_COLORS
 
-# Порог SP_norm для коллектора — для отображения вертикальной линии
+# Цвета для колонки интервалов (общий фон).
+RESERVOIR_COLOR = "#4CAF50"       # зелёный — reservoir
+NON_RESERVOIR_COLOR = "#E0E0E0"   # светло-серый — non_reservoir
+
+# Порог коллектора по SP_norm (0=песок, 1=глина).
+# Совпадает с segmentation.cutoff из config.yaml.
 SP_RESERVOIR_THRESHOLD = 0.6
 
 
 def plot_well(df, title, output_path, tvdss_range=None, layers=None,
-              intervals_df=None):
+              intervals_df=None, classification_params=None):
     """
     Рисует разрез. Ось Y — TVDSS (абсолютные отметки).
 
-    Параметры:
-        df           : pd.DataFrame из build_dataset
-                       (колонки depth_tvdss, SP, SP_norm, GK, GK_norm)
-        title        : заголовок
-        output_path  : куда сохранить PNG
-        tvdss_range  : (top_tvdss, bottom_tvdss) или None.
-                       Фильтр видимого диапазона по АО.
-        layers       : list[dict] из df.attrs["layers"]
-        intervals_df : pd.DataFrame из segment_all_layers
-                       (колонки top_tvdss, bottom_tvdss, kind,
-                       interval_index). Может быть None.
+    Параметры
+    ---------
+    df           : pd.DataFrame из build_dataset
+                   (колонки depth_tvdss, SP, SP_norm, GK, GK_norm)
+    title        : заголовок
+    output_path  : куда сохранить PNG
+    tvdss_range  : (top_tvdss, bottom_tvdss) или None.
+                   Фильтр видимого диапазона по АО.
+    layers       : list[dict] из df.attrs["layers"]
+    intervals_df : pd.DataFrame из segment_all_layers / classify_intervals.
+                   Если в нём есть колонки sp_top, sp_mid, sp_bot,
+                   form_type — на панели αПС будут наложены эталонные
+                   кривые соответствующих форм.
+    classification_params : ClassificationParams | None
+                   Нужен для edge_frac (позиции опорных зон).
+                   Если None — эталонные кривые не рисуются.
     """
     # --- Фильтрация по TVDSS ----------------------------------------
     if tvdss_range is not None:
@@ -77,15 +87,75 @@ def plot_well(df, title, output_path, tvdss_range=None, layers=None,
 
     ax2 = ax.twiny()
     if "SP_norm" in df.columns:
+        # SP_norm: 0 = песок, 1 = глина. Та же полярность, что у SP
+        # (SP высокий = глина), поэтому обе кривые идут согласованно —
+        # ровно как SP и GK_norm на соседних треках.
         ax2.plot(df["SP_norm"].to_numpy(), depth_tvdss,
                  color="tab:red", lw=1.0, alpha=0.9)
     ax2.set_xlim(0, 1)
-    # Порог коллектора — вертикальная штриховая линия
+    # Порог коллектора — вертикальная штриховая линия.
     ax2.axvline(x=SP_RESERVOIR_THRESHOLD, color="tab:red",
                 lw=0.7, ls="--", alpha=0.5)
     ax2.set_xlabel("SP_norm (0=песок, 1=глина)",
                    color="tab:red", fontsize=8)
     ax2.tick_params(axis="x", labelcolor="tab:red", labelsize=8)
+
+    # --- Эталонные кривые αПС по типам формы ------------------------
+    # Для каждого reservoir-интервала, у которого классификация дала
+    # конкретную форму, строим «идеальную» αПС и рисуем её штриховой
+    # линией поверх реальной. Цвет — из общей палитры FORM_COLORS.
+    if (
+        classification_params is not None
+        and intervals_df is not None
+        and not intervals_df.empty
+    ):
+        from src.domain.reference_curve import build_reference_curve
+
+        edge_frac = classification_params.edge_frac
+
+        for _, iv in intervals_df.iterrows():
+            # Рисуем только по коллекторам с определённой формой.
+            if iv.get("kind") != "reservoir":
+                continue
+            if pd.isna(iv.get("sp_top")) or pd.isna(iv.get("sp_mid")) \
+               or pd.isna(iv.get("sp_bot")):
+                continue
+            form = iv.get("form_type")
+            # non_reservoir и uncertain — эталон не рисуем.
+            # uncertain означает «форму опознать не удалось»,
+            # любая линия тут была бы выдумкой.
+            if form in (None, "non_reservoir", "uncertain"):
+                continue
+
+            top = float(iv["top_tvdss"])
+            bottom = float(iv["bottom_tvdss"])
+
+            # Точки интервала в отфильтрованном df.
+            mask = (df["depth_tvdss"] <= top) & \
+                   (df["depth_tvdss"] >= bottom)
+            sub = df.loc[mask, "depth_tvdss"]
+            if sub.empty:
+                continue
+
+            d = sub.to_numpy(dtype=float)
+            ref = build_reference_curve(
+                depth_tvdss=d,
+                top_tvdss=top,
+                bottom_tvdss=bottom,
+                sp_top=float(iv["sp_top"]),
+                sp_mid=float(iv["sp_mid"]),
+                sp_bot=float(iv["sp_bot"]),
+                edge_frac=edge_frac,
+                form_type=form,
+            )
+
+            color = FORM_COLORS.get(form, "#000000")
+
+            ax2.plot(
+                ref, d,
+                color=color, lw=1.4, ls="--", alpha=0.9,
+                zorder=5,
+            )
 
     # --- Панель 2: GK ----------------------------------------------
     ax = axes[2]

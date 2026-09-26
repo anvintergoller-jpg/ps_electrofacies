@@ -35,7 +35,9 @@ from src.application.build_dataset import build_dataset
 from src.domain.features import compute_container_features
 from src.visualization.well_log import plot_well
 from src.domain.segmentation import segment_all_layers
-
+from src.domain.classify_form import ClassificationParams, classify_intervals
+from src.visualization.form_legend import plot_form_legend
+from src.domain.size_class import classify_size_and_position
 
 
 def print_section(text):
@@ -155,12 +157,114 @@ def main():
                   f"{r['thickness_tvdss']:>8.2f} "
                   f"{r['n_points']:>7d}")
 
-    # Сохраняем интервалы в interim
+        # --- 7b. Классификация формы (шаг D.3) --------------------------
+    # Идёт сразу после сегментации: на вход подаём все интервалы,
+    # на выходе — тот же набор + колонки form_type, confidence,
+    # reason, а также сырые признаки формы (skewness, slopes,
+    # extremum_position) для отладки и будущей визуализации.
+    print_section("Классификация формы аномалий ПС")
+
+    cls_cfg = cfg["classification"]
+    cls_params = ClassificationParams.from_dict(cls_cfg)
+
+    intervals_df = classify_intervals(
+        df,
+        intervals_df,
+        params=cls_params,
+        smooth_window=cls_cfg.get("smooth_window", 5),
+    )
+
+    # Печатаем только коллекторные интервалы — по ним форма и считается.
+    print(f"\n  Правила классификации: версия {cls_params.rules_version}")
+    print("\n  Формы коллекторных интервалов:")
+    header = (f"  {'Пласт':<16} {'№':>3} {'Форма':<17} "
+              f"{'Conf':>5}  {'Опоры (top/mid/bot)':<22}  {'Пояснение'}")
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for _, r in intervals_df.iterrows():
+        if r["kind"] != "reservoir":
+            continue
+        ops = "—"
+        if r["sp_top"] is not None:
+            ops = (f"{r['sp_top']:.2f}/{r['sp_mid']:.2f}/"
+                   f"{r['sp_bot']:.2f}")
+        print(f"  {r['layer_name']:<16} "
+              f"{r['interval_index']:>3d} "
+              f"{r['form_type']:<17} "
+              f"{r['confidence']:>5.2f}  "
+              f"{ops:<22}  "
+              f"{r['reason']}")
+
+    # Сводка по типам форм (только коллекторы).
+    res_only = intervals_df[intervals_df["kind"] == "reservoir"]
+    if not res_only.empty:
+        print("\n  Распределение форм (только коллекторы):")
+        for ft, cnt in res_only["form_type"].value_counts().items():
+            print(f"    {ft:<17} {cnt}")
+
+            # --- 7c. Размер и положение в контейнере (шаг E) ----------------
+    print_section("Категории размера и положение в контейнере")
+
+    intervals_df = classify_size_and_position(
+        df,
+        intervals_df,
+        df.attrs["layers"],
+        cfg["size_classification"],
+    )
+
+    # Пороги относительного размера — из конфига, для справки в логе.
+    rel_small_max = cfg["size_classification"].get("relative_small_max", 0.33)
+    rel_large_min = cfg["size_classification"].get("relative_large_min", 0.67)
+
+    print(f"\n  Пороги размера (доля интервала в мощности контейнера):")
+    print(f"    small:  < {rel_small_max:.2f}")
+    print(f"    medium: {rel_small_max:.2f} … {rel_large_min:.2f}")
+    print(f"    large:  > {rel_large_min:.2f}")
+
+    # Таблица по коллекторным интервалам: форма + размер + положение.
+    print("\n  Коллекторные интервалы: форма, размер, положение:")
+    header = (f"  {'Пласт':<16} {'№':>3} {'Форма':<17} "
+              f"{'Мощн.AO':>9} {'Доля':>6} {'Размер':<8} "
+              f"{'Центроид':>9} {'Отн.':>6} {'Положение':<10}")
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for _, r in intervals_df.iterrows():
+        if r["kind"] != "reservoir":
+            continue
+        cr = r["centroid_relative"]
+        cr_str = f"{cr:.2f}" if pd.notna(cr) else "—"
+        centr = r["centroid_tvdss"]
+        centr_str = f"{centr:>9.2f}" if pd.notna(centr) else "        —"
+        pos = r["position_in_container"] if pd.notna(r["position_in_container"]) else "—"
+        rel = r["size_relative"]
+        rel_str = f"{rel:.3f}" if pd.notna(rel) else "—"
+        print(f"  {r['layer_name']:<16} "
+              f"{r['interval_index']:>3d} "
+              f"{r['form_type']:<17} "
+              f"{r['thickness_tvdss']:>9.2f} "
+              f"{rel_str:>6} "
+              f"{r['size_class']:<8} "
+              f"{centr_str} "
+              f"{cr_str:>6} "
+              f"{pos:<10}")
+
+    # Сводки по распределениям.
+    res_only = intervals_df[intervals_df["kind"] == "reservoir"]
+    if not res_only.empty:
+        print("\n  Распределение по размеру (только коллекторы):")
+        for sc, cnt in res_only["size_class"].value_counts().items():
+            print(f"    {sc:<10} {cnt}")
+        print("\n  Распределение по положению (только коллекторы):")
+        for pc, cnt in res_only["position_in_container"].value_counts().items():
+            print(f"    {pc:<10} {cnt}")
+
+    # Сохраняем интервалы со всеми колонками (форма + размер + положение).
     intervals_path = interim_dir / f"{well_name}_intervals_{run_id}.csv"
     intervals_df.to_csv(intervals_path, index=False, encoding="utf-8-sig")
-    print(f"\n  Интервалы: {intervals_path.resolve()}")
+    print(f"\n  Интервалы (форма + размер + положение): "
+          f"{intervals_path.resolve()}")
 
-    # --- 8. Признаки пластов (уровень A) ----------------------------
+       # --- 8. Признаки пластов (уровень A) ----------------------------
     print_section("Признаки пластов (уровень A)")
     features_df = compute_container_features(df, df.attrs["layers"])
 
@@ -215,8 +319,12 @@ def main():
     print(f"  Рабочий интервал в TVDSS: "
           f"{tvdss_top:.1f} … {tvdss_bot:.1f} м")
 
-    title = (f"Скважина {well_name}: SP, GK, отбивки\n"
+    title = (f"Скважина {well_name}: SP + SP_norm, GK, отбивки\n"
              f"АО {tvdss_top:.0f} … {tvdss_bot:.0f} м")
+
+    # Справочный рисунок «8 типов формы — профиль — условие».
+    legend_path = plots_dir / "form_legend.png"
+    plot_form_legend(legend_path)
 
     plot_well(
         df,
@@ -225,13 +333,14 @@ def main():
         tvdss_range=(tvdss_top, tvdss_bot),
         layers=df.attrs.get("layers", []),
         intervals_df=intervals_df,
+        classification_params=cls_params,
     )
 
-    print_section("ГОТОВО")
     print(f"\n  Файлы запуска {run_id}:")
     print(f"    {csv_path.name}")
     print(f"    {features_path.name}")
     print(f"    {png_path.name}")
+    print(f"    {legend_path.name}")
 
 
 if __name__ == "__main__":
