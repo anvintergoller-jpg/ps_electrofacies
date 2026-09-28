@@ -38,6 +38,7 @@ from src.domain.segmentation import segment_all_layers
 from src.domain.classify_form import ClassificationParams, classify_intervals
 from src.visualization.form_legend import plot_form_legend
 from src.domain.size_class import classify_size_and_position
+from src.domain.container_type import compute_container_types
 
 
 def print_section(text):
@@ -298,9 +299,51 @@ def main():
               f"{r['pct_sand_m']:>7.2f} "
               f"{r['pct_sand_c']:>7.2f}")
 
+        # --- 7d. Сводная типизация пласта (шаг F) -----------------------
+    print_section("Сводная типизация пласта")
+
+    features_df = compute_container_types(
+        features_df,
+        intervals_df,
+        df.attrs["layers"],
+        cfg["container_type"],
+    )
+
+    # Таблица по пластам: NTG, доминирующие характеристики, метка.
+    print("\n  Сводная типизация пластов:")
+    header = (f"  {'Пласт':<16} {'NTG':>6} {'N':>3} "
+              f"{'Форма':<17} {'Размер':<8} {'Положение':<10} "
+              f"{'Метка':<32}")
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for _, r in features_df.iterrows():
+        ntg = r["ntg_tvdss"] if pd.notna(r["ntg_tvdss"]) else 0.0
+        n = r["n_reservoir"] if pd.notna(r["n_reservoir"]) else 0
+        form = r["dominant_form"] if pd.notna(r["dominant_form"]) else "—"
+        size = r["dominant_size"] if pd.notna(r["dominant_size"]) else "—"
+        pos = r["dominant_position"] if pd.notna(r["dominant_position"]) else "—"
+        print(f"  {r['layer_name']:<16} "
+              f"{ntg:>6.3f} "
+              f"{n:>3d} "
+              f"{form:<17} "
+              f"{size:<8} "
+              f"{pos:<10} "
+              f"{r['container_type']:<32}")
+
+    # Расширенное описание (человеку) — под таблицей.
+    print("\n  Расширенное описание пластов:")
+    for _, r in features_df.iterrows():
+        print(f"    {r['layer_name']:<16} {r['container_summary']}")
+
+    # Распределение типов пластов.
+    if not features_df.empty:
+        print("\n  Распределение container_type:")
+        for ct, cnt in features_df["container_type"].value_counts().items():
+            print(f"    {ct:<32} {cnt}")
+
     features_path = interim_dir / f"{well_name}_features_{run_id}.csv"
     features_df.to_csv(features_path, index=False, encoding="utf-8-sig")
-    print(f"\n  Признаки: {features_path.resolve()}")
+    print(f"\n  Признаки (расширенные): {features_path.resolve()}")
 
     # --- 9. Визуализация рабочего интервала -------------------------
     print_section("Визуализация")
