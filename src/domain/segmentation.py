@@ -4,8 +4,8 @@
 См. docs/FEATURES.md, раздел 5.
 
 Алгоритм:
-    1. Сгладить SP_norm скользящим средним (окно из config).
-    2. Применить порог SP_norm < threshold → reservoir / non_reservoir.
+    1. Сгладить aSP скользящим средним (окно из config).
+    2. Применить порог aSP > threshold → reservoir (aSP: 1 = песок).
     3. Собрать непрерывные интервалы с одинаковой меткой.
     4. Объединить интервалы < min_thickness_m с соседями (по большинству).
 
@@ -71,17 +71,21 @@ def _label_points(sp_smoothed, threshold):
     Присваивает каждой точке метку reservoir/non_reservoir.
 
     Параметры:
-        sp_smoothed : np.ndarray — сглаженная SP_norm (NaN, где данных нет)
-        threshold   : float      — порог SP_norm (обычно 0.4)
+        sp_smoothed : np.ndarray — сглаженная aSP (NaN где данных нет)
+        threshold   : float      — порог aSP (обычно 0.4)
 
     Возвращает:
         np.ndarray[object] — метки: "reservoir", "non_reservoir" или None.
         None там, где sp_smoothed = NaN.
+
+    Правило (aSP: 0 = глина, 1 = песок):
+        aSP > threshold → reservoir (песчаник),
+        aSP ≤ threshold → non_reservoir (глина).
     """
     labels = np.full(len(sp_smoothed), None, dtype=object)
     valid = ~np.isnan(sp_smoothed)
-    labels[valid & (sp_smoothed < threshold)] = "reservoir"
-    labels[valid & (sp_smoothed >= threshold)] = "non_reservoir"
+    labels[valid & (sp_smoothed > threshold)] = "reservoir"
+    labels[valid & (sp_smoothed <= threshold)] = "non_reservoir"
     return labels
 
 
@@ -257,11 +261,11 @@ def _merge_adjacent_same_type(intervals):
 
 def segment_layer(
     depth_md,
-    sp_norm,
+    asp_values,
     top_tvdss_container,
     bottom_tvdss_container,
     md_to_tvdss_fn,
-    cutoff=0.6,
+    cutoff=0.4,
     smooth_window=5,
     min_thickness_tvdss=1.0,
 ):
@@ -270,20 +274,20 @@ def segment_layer(
 
     Параметры:
         depth_md              : np.ndarray — глубины по стволу, м MD
-        sp_norm               : np.ndarray — SP_norm (0..1), NaN там, где нет
+        asp_values : np.ndarray — aSP (0..1), NaN где нет данных
         top_tvdss_container   : float — кровля пласта в АО
         bottom_tvdss_container: float — подошва пласта в АО
         md_to_tvdss_fn        : callable — функция перевода MD → TVDSS
-        threshold             : float — порог SP_norm для коллектора
+        threshold             : float — порог aSP для коллектора
         smooth_window         : int — окно сглаживания в точках
         min_thickness_tvdss   : float — минимальная мощность интервала в АО, м
 
     Возвращает:
         list[Interval] — сегменты пласта, отсортированные сверху вниз.
-        Пустой список — если в пласте нет валидных точек SP_norm.
+        Пустой список — если в пласте нет валидных точек aSP.
     """
     # --- 1. Сглаживание ---------------------------------------------
-    sp_smoothed = smooth(sp_norm, smooth_window)
+    sp_smoothed = smooth(asp_values, smooth_window)
 
     # --- 2. Метки ---------------------------------------------------
     labels = _label_points(sp_smoothed, cutoff)
@@ -355,7 +359,7 @@ def segment_all_layers(df, layers, md_to_tvdss_fn, cfg):
             layer_name, interval_index, kind, top_md, bottom_md,
             top_tvdss, bottom_tvdss, thickness_md, thickness_tvdss, n_points
     """
-    cutoff = cfg.get("cutoff", 0.6)
+    cutoff = cfg.get("cutoff", 0.4)
     smooth_window = cfg.get("smooth_window", 5)
     min_thickness_tvdss = cfg.get("min_thickness_tvdss", 1.0)
 
@@ -370,11 +374,11 @@ def segment_all_layers(df, layers, md_to_tvdss_fn, cfg):
             continue
 
         depth_md = df_lay["depth_md"].to_numpy(dtype=float)
-        sp_norm = df_lay["SP_norm"].to_numpy(dtype=float)
+        asp_values = df_lay["aSP"].to_numpy(dtype=float)
 
         intervals = segment_layer(
             depth_md=depth_md,
-            sp_norm=sp_norm,
+            asp_values=asp_values,
             top_tvdss_container=lay["top_tvdss"],
             bottom_tvdss_container=lay["bottom_tvdss"],
             md_to_tvdss_fn=md_to_tvdss_fn,

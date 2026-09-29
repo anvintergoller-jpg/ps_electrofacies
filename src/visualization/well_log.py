@@ -4,7 +4,7 @@
 
 Панели (слева направо):
     1. Шкала глубин (TVDSS)
-    2. SP + SP_norm
+    2. SP + aSP
     3. GK + GK_norm
     4. Колонка интервалов
 
@@ -24,9 +24,9 @@ from src.visualization.form_legend import FORM_COLORS
 RESERVOIR_COLOR = "#4CAF50"       # зелёный — reservoir
 NON_RESERVOIR_COLOR = "#E0E0E0"   # светло-серый — non_reservoir
 
-# Порог коллектора по SP_norm (0=песок, 1=глина).
+# Порог коллектора по aSP (0=глина, 1=песок).
 # Совпадает с segmentation.cutoff из config.yaml.
-SP_RESERVOIR_THRESHOLD = 0.6
+ASP_RESERVOIR_THRESHOLD = 0.4
 
 
 def plot_well(df, title, output_path, tvdss_range=None, layers=None,
@@ -37,7 +37,7 @@ def plot_well(df, title, output_path, tvdss_range=None, layers=None,
     Параметры
     ---------
     df           : pd.DataFrame из build_dataset
-                   (колонки depth_tvdss, SP, SP_norm, GK, GK_norm)
+                (колонки depth_tvdss, SP, aSP, GK, GK_norm)
     title        : заголовок
     output_path  : куда сохранить PNG
     tvdss_range  : (top_tvdss, bottom_tvdss) или None.
@@ -86,17 +86,18 @@ def plot_well(df, title, output_path, tvdss_range=None, layers=None,
     ax.set_title("SP (ПС)")
 
     ax2 = ax.twiny()
-    if "SP_norm" in df.columns:
-        # SP_norm: 0 = песок, 1 = глина. Та же полярность, что у SP
-        # (SP высокий = глина), поэтому обе кривые идут согласованно —
-        # ровно как SP и GK_norm на соседних треках.
-        ax2.plot(df["SP_norm"].to_numpy(), depth_tvdss,
+    if "aSP" in df.columns:
+        # aSP (alpha-PS): 1 = чистый песок, 0 = глина.
+        ax2.plot(df["aSP"].to_numpy(), depth_tvdss,
                  color="tab:red", lw=1.0, alpha=0.9)
-    ax2.set_xlim(0, 1)
+    # Ось инвертирована: 1 (песок) слева, 0 (глина) справа.
+    # Так кривая aSP идёт согласованно с сырой SP
+    # (у SP высокое значение = глина = справа).
+    ax2.set_xlim(1, 0)
     # Порог коллектора — вертикальная штриховая линия.
-    ax2.axvline(x=SP_RESERVOIR_THRESHOLD, color="tab:red",
+    ax2.axvline(x=ASP_RESERVOIR_THRESHOLD, color="tab:red",
                 lw=0.7, ls="--", alpha=0.5)
-    ax2.set_xlabel("SP_norm (0=песок, 1=глина)",
+    ax2.set_xlabel("aSP (1=песок, 0=глина)",
                    color="tab:red", fontsize=8)
     ax2.tick_params(axis="x", labelcolor="tab:red", labelsize=8)
 

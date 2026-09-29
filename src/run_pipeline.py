@@ -45,6 +45,7 @@ from src.domain.size_class import classify_size_and_position
 from src.domain.container_type import compute_container_types
 from src.visualization.well_log import plot_well
 from src.visualization.form_legend import plot_form_legend
+from src.domain.cross_well_summary import build_cross_well_summary
 
 
 def print_section(text):
@@ -205,7 +206,7 @@ def process_well(well_name, cfg, mnem, output_dir):
     tvdss_bot = kb - tvd_bot
     print(f"  Рабочий интервал в TVDSS: {tvdss_top:.1f} … {tvdss_bot:.1f} м")
 
-    title = (f"Скважина {well_name}: SP + SP_norm, GK, отбивки\n"
+    title = (f"Скважина {well_name}: SP + aSP, GK, отбивки\n"
              f"АО {tvdss_top:.0f} … {tvdss_bot:.0f} м")
 
     plot_name = cfg["output"].get("plot_name", "well_log.png")
@@ -345,6 +346,17 @@ def main():
         print_section("СВОДНАЯ ТАБЛИЦА")
         print(f"  Строк (пластов × скважин): {len(summary_df)}")
         print(f"  Файл: {summary_path.resolve()}")
+
+        # --- Сопоставление пластов между скважинами (шаг H) ---------
+        print_section("СОПОСТАВЛЕНИЕ ПЛАСТОВ МЕЖДУ СКВАЖИНАМИ")
+        cross_well_paths = build_cross_well_summary(
+            summary_df,
+            output_dir,
+            cfg.get("cross_well_summary", {}),
+        )
+        print(f"\n  Артефакты:")
+        for name, path in cross_well_paths.items():
+            print(f"    {name:<16} {path.resolve()}")
     else:
         print("\n  [!] Нет данных для сводной таблицы — все скважины упали.")
 

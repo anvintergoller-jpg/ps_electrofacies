@@ -17,8 +17,10 @@
 Что делать с NaN:
     NaN остаются NaN. np.nanpercentile их игнорирует.
 
-Возвращает:
-    Тот же DataFrame с добавленными колонками SP_norm, GK_norm.
+    Возвращает:
+        Тот же DataFrame с колонками aSP, GK_norm.
+        aSP: 0 = глина, 1 = песок (αПС).
+        GK_norm: 0 = песок, 1 = глина.
 """
 
 import numpy as np
@@ -53,37 +55,35 @@ def _baseline_from_percentiles(values, shale_pct, sand_pct):
 
 def _normalize_curve(values, shale_value, sand_value):
     """
-    Линейно нормирует кривую к [0, 1].
+    Нормирует кривую SP к шкале aSP (alpha-PS): 0 = глина, 1 = песок.
 
-    Формула: (x - sand) / (shale - sand)
-        0 → песчаник
-        1 → глина
+    Классическая геофизическая конвенция:
+        aSP = 0 — чистая глина,
+        aSP = 1 — чистый песчаник.
+    Эквивалент: aSP = 1 − SP_norm, где SP_norm была старой шкалой
+    (0 = песок, 1 = глина).
 
-    Параметры:
-        values      : array-like
-        shale_value : float — опорное значение 'глина' (верх)
-        sand_value  : float — опорное значение 'песок' (низ)
+    Параметры
+    ---------
+    values      : array-like
+    shale_value : float — опорное значение 'глина'
+    sand_value  : float — опорное значение 'песок'
 
-    Возвращает:
-        np.ndarray, значения вне [0, 1] обрезаны до 0 и 1.
-
-    Про деление на ноль:
-        Если shale == sand, знаменатель ноль. Возвращаем NaN —
-        пусть валидатор потом отдельно пожалуется.
+    Возвращает
+    ----------
+    np.ndarray, значения обрезаны до [0, 1].
     """
     arr = np.asarray(values, dtype=float)
 
     denom = shale_value - sand_value
     if not np.isfinite(denom) or abs(denom) < 1e-9:
-        # Нечего нормировать — кривая константа или пустая
         return np.full_like(arr, np.nan)
 
-    norm = (arr - sand_value) / denom
+    # aSP = (shale − x) / (shale − sand)
+    aSP = (shale_value - arr) / denom
+    aSP = np.clip(aSP, 0.0, 1.0)
 
-    # Обрезаем хвосты за пределами [0, 1] — там шум/выбросы
-    norm = np.clip(norm, 0.0, 1.0)
-
-    return norm
+    return aSP
 
 
 def normalize_curves(df, cfg, interval=None):
@@ -160,7 +160,12 @@ def normalize_curves(df, cfg, interval=None):
         norm_full = np.asarray(norm_full, dtype=float)
         norm_full[~in_interval] = np.nan
 
-        result[f"{canonical}_norm"] = norm_full
+                # SP → колонка aSP (0 = глина, 1 = песок).
+        # Остальные кривые (GK) → *_norm (0 = песок, 1 = глина).
+        if canonical == "SP":
+            result["aSP"] = norm_full
+        else:
+            result[f"{canonical}_norm"] = norm_full
         baselines[canonical] = (shale, sand)
 
     # --- Атрибуты для отчёта ----------------------------------------

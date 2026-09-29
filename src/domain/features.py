@@ -18,21 +18,21 @@ def layer_stats(df_layer):
     Считает простую статистику по точкам одного пласта.
 
     Параметры:
-        df_layer : pd.DataFrame — строки пласта (с колонкой SP_norm)
+        df_layer : pd.DataFrame — строки пласта (с колонкой aSP)
 
     Возвращает dict:
         n_points     — всего точек
-        n_sp_valid   — точек с валидным SP_norm
+        n_sp_valid   — точек с валидным aSP
         sp_coverage  — доля валидных, 0..1
     """
     n = len(df_layer)
     if n == 0:
         return {"n_points": 0, "n_sp_valid": 0, "sp_coverage": 0.0}
 
-    if "SP_norm" not in df_layer.columns:
+    if "aSP" not in df_layer.columns:
         return {"n_points": n, "n_sp_valid": 0, "sp_coverage": 0.0}
 
-    sp = df_layer["SP_norm"].to_numpy(dtype=float)
+    sp = df_layer["aSP"].to_numpy(dtype=float)
     n_valid = int(np.sum(~np.isnan(sp)))
 
     return {
@@ -41,28 +41,28 @@ def layer_stats(df_layer):
         "sp_coverage": n_valid / n if n > 0 else 0.0,
     }
 
-def compute_lithology_profile(sp_norm_values, smooth_window=5):
+def compute_lithology_profile(asp_values, smooth_window=5):
     """
     Считает доли точек в каждом из пяти классов αПС.
 
-    Классы (по Муромцеву):
-        pct_shale       — глина             αПС 0.0-0.2  SP_norm 0.8-1.0
-        pct_silty_shale — алевролит глин.   αПС 0.2-0.4  SP_norm 0.6-0.8
-        pct_silt        — алевролиты/пески  αПС 0.4-0.6  SP_norm 0.4-0.6
-        pct_sand_m      — песчаник ср/з     αПС 0.6-0.8  SP_norm 0.2-0.4
-        pct_sand_c      — песчаник кр/з     αПС 0.8-1.0  SP_norm 0.0-0.2
+    Классы (по Муромцеву), шкала aSP (0 = глина, 1 = песок):
+        pct_shale       — глина             aSP 0.0–0.2
+        pct_silty_shale — алевролит глин.   aSP 0.2–0.4
+        pct_silt        — алевролиты/пески  aSP 0.4–0.6
+        pct_sand_m      — песчаник ср/з     aSP 0.6–0.8
+        pct_sand_c      — песчаник кр/з     aSP 0.8–1.0
 
-    Сглаживание применяется для устойчивости: одиночные точки
-    на границе корзин дают шум, сглаживание его убирает.
+    Сглаживание — для устойчивости (одиночные точки на границе
+    корзин дают шум).
 
     Параметры:
-        sp_norm_values : np.ndarray — SP_norm пласта (с NaN)
-        smooth_window  : int — окно сглаживания, из config
+        asp_values : np.ndarray — aSP пласта (с NaN)
+        smooth_window  : int — окно сглаживания
 
     Возвращает:
         dict с пятью ключами pct_*, сумма = 1.0 (или 0.0, если нет данных).
     """
-    arr = np.asarray(sp_norm_values, dtype=float)
+    arr = np.asarray(asp_values, dtype=float)
     smoothed = smooth(arr, smooth_window)
 
     valid = smoothed[~np.isnan(smoothed)]
@@ -78,11 +78,11 @@ def compute_lithology_profile(sp_norm_values, smooth_window=5):
         }
 
     return {
-        "pct_shale":       float(np.sum(valid >= 0.8) / n),
-        "pct_silty_shale": float(np.sum((valid >= 0.6) & (valid < 0.8)) / n),
+        "pct_shale":       float(np.sum(valid < 0.2) / n),
+        "pct_silty_shale": float(np.sum((valid >= 0.2) & (valid < 0.4)) / n),
         "pct_silt":        float(np.sum((valid >= 0.4) & (valid < 0.6)) / n),
-        "pct_sand_m":      float(np.sum((valid >= 0.2) & (valid < 0.4)) / n),
-        "pct_sand_c":      float(np.sum(valid < 0.2) / n),
+        "pct_sand_m":      float(np.sum((valid >= 0.6) & (valid < 0.8)) / n),
+        "pct_sand_c":      float(np.sum(valid >= 0.8) / n),
     }
 
 def compute_container_features(df, layers):
@@ -91,7 +91,7 @@ def compute_container_features(df, layers):
 
     Параметры:
         df     : pd.DataFrame из build_dataset
-                 (содержит depth_md, SP_norm, layer_name)
+                 (содержит depth_md, aSP, layer_name)
         layers : list[dict] из df.attrs["layers"]
                  (в каждом — top_md, bottom_md, top_tvdss, ...)
 
@@ -109,9 +109,9 @@ def compute_container_features(df, layers):
 
         stats = layer_stats(df_lay)
 
-        # Литологический профиль — по SP_norm пласта
-        if "SP_norm" in df_lay.columns:
-            sp = df_lay["SP_norm"].to_numpy(dtype=float)
+        # Литологический профиль — по aSP пласта
+        if "aSP" in df_lay.columns:
+            sp = df_lay["aSP"].to_numpy(dtype=float)
         else:
             sp = np.array([])
         litho = compute_lithology_profile(sp, smooth_window=5)

@@ -6,11 +6,11 @@
 
 Идея
 ----
-На вход — массив SP_norm ТОЛЬКО для точек одного коллекторного
+На вход — массив aSP ТОЛЬКО для точек одного коллекторного
 интервала (сверху вниз). На выходе — тип формы, уверенность
 и короткое объяснение для геолога.
 
-Шкала SP_norm: ~1.0 = глина, ~0.0 = песчаник.
+Шкала aSP (alpha-PS): ~0.0 = глина, ~1.0 = чистый песчаник.
 
 Типы форм (7):
     cylinder          — ровное плато на песчаном уровне
@@ -22,7 +22,7 @@
     uncertain         — не определено (в т.ч. возможное переслаивание)
     non_reservoir     — неколлектор
 
-Ключевой признак frac_core — доля точек, где |SP_norm − sp_mid| < core_threshold.
+Ключевой признак frac_core — доля точек, где |aSP − sp_mid| < core_threshold.
 Разделяет trapezoid-middle / symmetric / v-shape (у них одинаковые опоры,
 но разная форма перехода).
 """
@@ -157,7 +157,7 @@ def _has_multiple_minima(
     Параметры
     ---------
     values : последовательность float
-    cutoff : float — порог SP_norm (0.60)
+    cutoff : float — порог aSP (0.40)
     min_run_length : int — минимальная длина «полки» (5 точек)
 
     Возвращает True, если найдено ≥ 2 устойчивых песчаных «полки».
@@ -249,24 +249,20 @@ def classify_form(
     frac_core = _compute_frac_core(clean, sp_mid, params.core_threshold)
     result["frac_core"] = frac_core
 
-    cutoff = params.reservoir_cutoff
+    cutoff = params.reservoir_cutoff  # 0.40 в шкале aSP
 
-        # -------------------------------------------------------------------
+    cutoff = params.reservoir_cutoff  # 0.40 в шкале aSP
+
+    # -------------------------------------------------------------------
     # Шаг 2. M-форма (переслаивание)
     # -------------------------------------------------------------------
-    # Признак 1: песчаные кровля и подошва, глинистый центр
-    # (опоры сверху и снизу — в песчаной зоне, центр — в глинистой).
-    # Признак 2: два и более УСТОЙЧИВЫХ захода в песок — переслаивание
-    # без явного «глинистого центра» по опорам.
-        # M-форма — переслаивание внутри интервала.
-    # Ловим только по опорам: явная M-образная форма.
-    # Тонкие переслаивания по всей длине кривой не ловим —
-    # для этого нужны другие признаки, которых у нас пока нет
-    # (см. docs/DECISIONS_LOG.md).
+    # В aSP: 0 = глина, 1 = песок.
+    # M-форма — кровля и подошва в песчаной зоне (высокие aSP),
+    # центр — в глинистой (низкий aSP).
     is_m_shape = (
-        sp_top < cutoff
-        and sp_bot < cutoff
-        and sp_mid > cutoff + params.slope_threshold
+        sp_top > cutoff
+        and sp_bot > cutoff
+        and sp_mid < cutoff - params.slope_threshold
     )
 
     if is_m_shape:
@@ -276,20 +272,15 @@ def classify_form(
                             "проверьте сегментацию")
         return result
 
-        # -------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # Шаг 3. Цилиндр: ровное плато на песчаном уровне
     # -------------------------------------------------------------------
-    # Цилиндр = всё плато на песчаном уровне. Условие:
-    #   • все три опоры в песчаной зоне;
-    #   • верх и низ совпадают (|diff_top_bot| < threshold);
-    #   • ядро вокруг sp_mid широкое (frac_core ≥ frac_core_trapezoid).
-    #
-    # Отличие от V-формы: у V-формы верх и низ тоже совпадают,
-    # но ядро узкое (только вершина V).
+    # Все три опоры в песчаной зоне (aSP > cutoff) и близко друг к другу.
+    # frac_core — широкое ядро вокруг sp_mid (высокий aSP).
     if (
-        sp_top < cutoff
-        and sp_mid < cutoff
-        and sp_bot < cutoff
+        sp_top > cutoff
+        and sp_mid > cutoff
+        and sp_bot > cutoff
         and abs(diff_top_bot) < params.threshold_diff
         and frac_core >= params.frac_core_trapezoid
     ):
@@ -299,17 +290,16 @@ def classify_form(
         return result
 
     # -------------------------------------------------------------------
-    # Шаг 4. Глина — песок — глина
+    # Шаг 4. Глина — песок — глина (symmetric / trapezoid-middle / v-shape)
     # -------------------------------------------------------------------
-    # sp_top и sp_bot примерно равны, sp_mid заметно ниже (песок в центре).
+    # Верх и низ — глинистые (низкие aSP), центр — песчаный (высокий aSP).
     top_bot_close = abs(diff_top_bot) < params.threshold_diff
-    mid_is_low = (
-        sp_mid < sp_top - params.slope_threshold
-        and sp_mid < sp_bot - params.slope_threshold
+    mid_is_high = (
+        sp_mid > sp_top + params.slope_threshold
+        and sp_mid > sp_bot + params.slope_threshold
     )
 
-    if top_bot_close and mid_is_low:
-        # Различаем по ширине ядра.
+    if top_bot_close and mid_is_high:
         if frac_core >= params.frac_core_trapezoid:
             result["form_type"] = "trapezoid-middle"
             result["confidence"] = min(1.0, 0.5 + frac_core)
@@ -320,16 +310,19 @@ def classify_form(
             result["reason"] = "плавная чаша песка (парабола)"
         else:
             result["form_type"] = "v-shape"
-            result["confidence"] = min(1.0, 0.5 + (params.frac_core_v_shape
-                                                    - frac_core) * 3)
+            result["confidence"] = min(
+                1.0, 0.5 + (params.frac_core_v_shape - frac_core) * 3
+            )
             result["reason"] = "острый угол, песчаный пик в центре"
         return result
 
     # -------------------------------------------------------------------
     # Шаг 5. Bell: глина сверху, песок снизу
     # -------------------------------------------------------------------
-    if diff_top_bot > params.threshold_diff:
-        conf = min(1.0, diff_top_bot / params.threshold_diff - 0.5)
+    # В aSP: sp_top низкий (глина), sp_bot высокий (песок)
+    # → diff_top_bot = sp_top − sp_bot < −threshold.
+    if diff_top_bot < -params.threshold_diff:
+        conf = min(1.0, abs(diff_top_bot) / params.threshold_diff - 0.5)
         result["form_type"] = "bell"
         result["confidence"] = max(0.0, conf)
         result["reason"] = "глина сверху, песок снизу"
@@ -338,8 +331,10 @@ def classify_form(
     # -------------------------------------------------------------------
     # Шаг 6. Funnel: песок сверху, глина снизу
     # -------------------------------------------------------------------
-    if diff_top_bot < -params.threshold_diff:
-        conf = min(1.0, abs(diff_top_bot) / params.threshold_diff - 0.5)
+    # sp_top высокий (песок), sp_bot низкий (глина)
+    # → diff_top_bot > +threshold.
+    if diff_top_bot > params.threshold_diff:
+        conf = min(1.0, diff_top_bot / params.threshold_diff - 0.5)
         result["form_type"] = "funnel"
         result["confidence"] = max(0.0, conf)
         result["reason"] = "песок сверху, глина снизу"
@@ -387,8 +382,8 @@ def classify_intervals(
         return out
 
     depth = df["depth_md"].to_numpy(dtype=float)
-    sp_norm = df["SP_norm"].to_numpy(dtype=float)
-    sp_smooth_full = smooth(sp_norm, smooth_window)
+    aSP = df["aSP"].to_numpy(dtype=float)
+    sp_smooth_full = smooth(aSP, smooth_window)
 
     rows = []
     for _, iv in intervals_df.iterrows():
