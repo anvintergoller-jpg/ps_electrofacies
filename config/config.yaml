@@ -11,22 +11,42 @@ project:
   name: "ps_electrofacies"
   version: "0.1.0"
 
-# Пилотная скважина (одна на этом этапе)
-pilot_well:
-  name: "227_2263"
-  files:
-    las:       "data/raw/las/227_2263.las"
-    deviation: "data/raw/deviation/227_2263.dev"
-    markers:   "data/raw/markers/welltops_227_2263.xlsx"
+# ------------------------------------------------------------
+# Список скважин для обработки
+# ------------------------------------------------------------
+# Два режима:
+#
+#   wells: "auto"    — скважины находятся автоматически:
+#                      код сканирует data/raw/las/*.las и берёт
+#                      имена файлов без расширения. Сортировка
+#                      по имени. Удобно, когда скважин много.
+#
+#   wells:           — явный список имён:
+#     - "227_2263"     берутся только эти скважины, в этом порядке.
+#     - "227_2264"
+#     - ...
+#
+# Имена должны точно совпадать с:
+#   • именами файлов LAS и .dev (без расширения),
+#   • значением в столбце "Well identifier (Well name)" в отбивках.
+wells: "auto"
+
+# Шаблоны путей к входным файлам.
+# {well} подставляется на имя скважины.
+# Отбивки — один общий файл, без {well}.
+paths_templates:
+  las:       "data/raw/las/{well}.las"
+  deviation: "data/raw/deviation/{well}.dev"
+  markers:   "data/raw/markers/welltops_all.xlsx"
 
 # ------------------------------------------------------------
 # Общие настройки
 # ------------------------------------------------------------
 paths:
-  interim_dir:   "data/interim"
-  processed_dir: "data/processed"
-  results_dir:   "results"
-  logs_dir:      "logs"
+  interim_dir:    "data/interim"      # для отладочных запусков
+  processed_dir:  "data/processed"    # сюда пишем результаты батча
+  results_dir:    "results"           # legacy (легенда форм)
+  logs_dir:       "logs"              # legacy
 
 # ------------------------------------------------------------
 # Чтение LAS
@@ -78,8 +98,16 @@ markers:
   marker_name_column_name: "Surface"
   # TVDSS = глубина относительно MSL (в вашем файле "PVD auto")
   tvdss_column_name: "PVD auto"
-  # Брать все маркеры, либо ограничить список: ["БС9_TOP_S", "БС10-1_TOP_S"]
-  markers_to_use: "all"
+
+  # Какие маркеры берём в работу:
+  #   "all"          — все как есть (не рекомендуется: попадут _BOT);
+  #   "tops_only"    — только оканчивающиеся на "_TOP_S";
+  #   [список имён]  — только эти маркеры.
+  #
+  # Пласты задаются кровлями. Маркеры типа "БС9_BOT_S" и "БС12_BOT"
+  # — это подошвы; они дублируют кровлю следующего пласта
+  # и приводят к пластам нулевой мощности.
+  markers_to_use: "tops_only"
 
 # ------------------------------------------------------------
 # Нормализация кривых
@@ -198,3 +226,25 @@ container_type:
   # Если разница двух топ-значений < dominance_margin × total_reservoir,
   # выбираем по confidence.
   dominance_margin: 0.10
+
+  # ------------------------------------------------------------
+# Настройки выходных файлов (батч-режим)
+# ------------------------------------------------------------
+# В data/processed/<well_name>/ сохраняются:
+#   dataset.csv     — единая таблица точка-за-точкой
+#   intervals.csv   — интервалы (форма + размер + положение)
+#   features.csv    — признаки пластов + сводная типизация
+#   well_log.png    — планшет
+#   log.txt         — лог по скважине
+#
+# В data/processed/ (корень) сохраняется:
+#   summary_all_wells_<ts>.csv — сводная таблица по всем скважинам
+#   run_log_<ts>.txt           — общий лог запуска
+output:
+  dataset_name:   "dataset.csv"
+  intervals_name: "intervals.csv"
+  features_name:  "features.csv"
+  plot_name:      "well_log.png"
+  log_name:       "log.txt"
+  summary_name:   "summary_all_wells_{ts}.csv"
+  run_log_name:   "run_log_{ts}.txt"

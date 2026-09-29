@@ -60,7 +60,7 @@ def _mark_layers(depth_md, layers):
     return result
 
 
-def build_dataset(df_las, df_dev, df_markers, cfg, mnem_cfg=None):
+def build_dataset(df_las, df_dev, df_markers, cfg, well_name, mnem_cfg=None):
     """
     Собирает единую таблицу по скважине.
 
@@ -69,6 +69,7 @@ def build_dataset(df_las, df_dev, df_markers, cfg, mnem_cfg=None):
         df_dev      : pd.DataFrame — из deviation_reader.read_deviation
         df_markers  : pd.DataFrame — из markers_reader.read_markers
         cfg         : dict         — полный config.yaml
+        well_name   : str          — имя скважины (для attrs["source_well"])
         mnem_cfg    : не используется (для совместимости)
 
     Возвращает:
@@ -137,6 +138,6 @@ def build_dataset(df_las, df_dev, df_markers, cfg, mnem_cfg=None):
     # --- 8. Атрибуты результата -------------------------------------
     df.attrs["kb"] = kb
     df.attrs["layers"] = layers
-    df.attrs["source_well"] = cfg["pilot_well"]["name"]
+    df.attrs["source_well"] = well_name
 
     return df

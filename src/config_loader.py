@@ -71,3 +71,68 @@ def load_config(path="config/config.yaml"):
 def load_mnemonic_map(path="config/mnemonic_map.yaml"):
     """Читает словарь синонимов мнемоник кривых."""
     return load_yaml(path)
+
+def resolve_wells(cfg):
+    """
+    Вернуть список имён скважин для обработки.
+
+    Логика:
+        • cfg["wells"] — список имён → возвращаем как есть;
+        • cfg["wells"] == "auto"   → сканируем папку LAS,
+          берём имена файлов без расширения, сортируем по имени.
+
+    Папка и расширение берутся из шаблона cfg["paths_templates"]["las"]
+    (например, "data/raw/las/{well}.las" → папка data/raw/las,
+    расширение .las).
+
+    Параметры
+    ---------
+    cfg : dict — результат load_config()
+
+    Возвращает
+    ----------
+    list[str] — имена скважин в порядке обработки.
+
+    Исключения
+    ----------
+    FileNotFoundError — если папка LAS не существует или пуста
+                        (в режиме auto).
+    ValueError        — если cfg["wells"] не распознано.
+    """
+    wells_cfg = cfg.get("wells", "auto")
+
+    # Режим 1: явный список.
+    if isinstance(wells_cfg, list):
+        return [str(w) for w in wells_cfg]
+
+    # Режим 2: auto — сканируем папку LAS.
+    if wells_cfg == "auto":
+        las_template = cfg["paths_templates"]["las"]
+
+        # Из шаблона "data/raw/las/{well}.las" получаем папку и расширение.
+        template_path = Path(las_template)
+        las_dir = template_path.parent
+        las_ext = template_path.suffix  # ".las"
+
+        if not las_dir.exists():
+            raise FileNotFoundError(
+                f"Папка с LAS-файлами не найдена: {las_dir.resolve()}"
+            )
+
+        # Ищем файлы с нужным расширением, сортируем по имени.
+        files = sorted(las_dir.glob(f"*{las_ext}"))
+        wells = [f.stem for f in files]
+
+        if not wells:
+            raise FileNotFoundError(
+                f"В папке {las_dir.resolve()} нет файлов *{las_ext}"
+            )
+
+        return wells
+
+    # Неизвестный формат — лучше упасть с понятной ошибкой.
+    raise ValueError(
+        f"Некорректное значение 'wells' в config.yaml: {wells_cfg!r}. "
+        f"Ожидается список (например, [227_2263, 227_2264]) "
+        f"или строка 'auto'."
+    )

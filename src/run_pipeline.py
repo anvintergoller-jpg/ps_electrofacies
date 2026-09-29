@@ -1,44 +1,50 @@
+# -*- coding: utf-8 -*-
 """
-Полный цикл обработки одной скважины.
+Батч-обработка скважин.
 
 Запуск из корня проекта:
     python -m src.run_pipeline
 
-Шаги:
-    1. Читаем конфиги.
-    2. Читаем LAS, .dev, отбивки.
-    3. Определяем рабочий интервал.
-    4. Нормализуем кривые внутри рабочего интервала.
-    5. Собираем единый DataFrame.
-    6. Сохраняем его в data/interim/.
-    7. Считаем признаки пластов (уровень A).
-    8. Строим график и сохраняем в results/plots/.
+Логика:
+    1. Читаем config, получаем список скважин (resolve_wells).
+    2. По каждой скважине — process_well(): полный цикл
+       (LAS → датасет → сегментация → форма → размер/положение →
+        признаки → container_type → PNG).
+    3. Результат — в data/processed/<well_name>/:
+           dataset.csv, intervals.csv, features.csv, well_log.png, log.txt
+    4. Сводка по всем скважинам — data/processed/summary_all_wells_<ts>.csv
+    5. Общий лог запуска — data/processed/run_log_<ts>.txt
+    6. Легенда форм (общая) — data/processed/form_legend.png
+    7. Ошибка в одной скважине не останавливает остальные.
 
-Выходные файлы:
-    data/interim/{well_name}_dataset.csv
-    data/interim/{well_name}_features.csv
-    results/plots/{well_name}_well_log.png
+Список скважин берётся из config.yaml, секция wells:
+    wells: "auto"       — сканируем data/raw/las/*.las
+    wells: [список]     — только указанные скважины
 """
 
 from pathlib import Path
 from datetime import datetime
 
+import io
+import contextlib
+import traceback
+
 import numpy as np
 import pandas as pd
 
-from src.config_loader import load_config, load_mnemonic_map
+from src.config_loader import load_config, load_mnemonic_map, resolve_wells
 from src.ingestion.las_reader import read_las
 from src.ingestion.deviation_reader import read_deviation, md_to_tvd
 from src.ingestion.markers_reader import read_markers
 from src.preprocessing.normalization import normalize_curves
 from src.application.build_dataset import build_dataset
 from src.domain.features import compute_container_features
-from src.visualization.well_log import plot_well
 from src.domain.segmentation import segment_all_layers
 from src.domain.classify_form import ClassificationParams, classify_intervals
-from src.visualization.form_legend import plot_form_legend
 from src.domain.size_class import classify_size_and_position
 from src.domain.container_type import compute_container_types
+from src.visualization.well_log import plot_well
+from src.visualization.form_legend import plot_form_legend
 
 
 def print_section(text):
@@ -47,22 +53,33 @@ def print_section(text):
     print(f"\n{line}\n  {text}\n{line}")
 
 
-def main():
-    # --- 1. Конфиги -------------------------------------------------
-    cfg = load_config()
-    mnem = load_mnemonic_map()
+def resolve_paths(well_name, cfg):
+    """
+    Собрать пути к файлам одной скважины по шаблонам из config.
+    Возвращает dict с ключами las, deviation, markers.
+    """
+    templates = cfg["paths_templates"]
+    return {key: tpl.format(well=well_name) for key, tpl in templates.items()}
 
-    well_cfg = cfg["pilot_well"]
-    well_name = well_cfg["name"]
-    files = well_cfg["files"]
+
+def process_well(well_name, cfg, mnem, output_dir):
+    """
+    Полный цикл обработки одной скважины.
+
+    Пишет результат в output_dir/<well_name>/:
+        dataset.csv, intervals.csv, features.csv, well_log.png
+
+    Возвращает dict:
+        well_name   — имя скважины
+        status      — "ok" (при сбое main() обернёт в fail)
+        features_df — DataFrame признаков (для сводки) или None
+        files       — dict с путями сохранённых файлов
+    """
+    files = resolve_paths(well_name, cfg)
 
     print_section(f"ОБРАБОТКА СКВАЖИНЫ {well_name}")
 
-    # Метка запуска — используется в именах выходных файлов
-    run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    print(f"  Метка запуска: {run_id}")
-
-    # --- 2. Чтение входных данных -----------------------------------
+    # --- 1. Чтение входных данных -----------------------------------
     print_section("Чтение LAS")
     df_las = read_las(files["las"], cfg["las"], mnem)
     print(f"  Точек: {len(df_las)}")
@@ -75,8 +92,7 @@ def main():
     df_mark = read_markers(files["markers"], well_name, cfg["markers"])
     print(f"  Маркеров: {len(df_mark)}")
 
-    # --- 3. Определяем рабочий интервал -----------------------------
-    # Верх — самая верхняя кровля, низ — конец данных в .dev
+    # --- 2. Рабочий интервал ----------------------------------------
     top_md = float(df_mark["md"].min())
     bottom_md = float(df_dev["MD"].max())
 
@@ -85,290 +101,115 @@ def main():
     print(f"  Низ  (конец .dev):    {bottom_md:.2f} м MD")
     print(f"  Мощность интервала:   {bottom_md - top_md:.2f} м")
 
-    # --- 4. Нормализация внутри интервала ---------------------------
-    print_section("Нормализация кривых (внутри интервала)")
+    # --- 3. Нормализация --------------------------------------------
+    print_section("Нормализация кривых")
     df_las = normalize_curves(
-        df_las,
-        cfg["normalization"],
-        interval=(top_md, bottom_md),
+        df_las, cfg["normalization"], interval=(top_md, bottom_md),
     )
     bl = df_las.attrs.get("baselines", {})
     for name, (shale, sand) in bl.items():
         print(f"  {name}: shale = {shale:.2f}, sand = {sand:.2f}")
 
-    # --- 5. Сборка единого набора -----------------------------------
+    # --- 4. Сборка датасета -----------------------------------------
     print_section("Сборка единой таблицы")
-    df = build_dataset(df_las, df_dev, df_mark, cfg)
+    df = build_dataset(df_las, df_dev, df_mark, cfg, well_name)
     print(f"  Строк всего: {len(df)}")
     print(f"  Колонки: {list(df.columns)}")
 
-    n_in = int(((df["depth_md"] >= top_md) & (df["depth_md"] <= bottom_md)).sum())
-    print(f"  Строк в рабочем интервале: {n_in}")
-
-    print("\n  Точек в каждом пласте:")
-    layer_counts = df["layer_name"].value_counts(dropna=False)
-    for name, count in layer_counts.items():
-        label = name if name is not None else "(вне пластов)"
-        print(f"    {label:>15}: {count}")
-    
-    # Замыкание: MD → TVDSS. Оборачиваем для передачи в сегментацию.
+    # Замыкание: MD → TVDSS (Petrel-стиль, отрицательное вниз).
     _kb = df_dev.attrs.get("kb", 0.0)
+
     def md_to_tvdss(md_value):
         tvd = float(md_to_tvd(df_dev, np.array([md_value]))[0])
         return _kb - tvd
 
-     # --- 6. Сохранение в interim ------------------------------------
-    print_section("Сохранение результата")
-    interim_dir = Path(cfg["paths"]["interim_dir"])
-    interim_dir.mkdir(parents=True, exist_ok=True)
+    # Папка вывода по скважине.
+    well_dir = output_dir / well_name
+    well_dir.mkdir(parents=True, exist_ok=True)
 
-    csv_path = interim_dir / f"{well_name}_dataset_{run_id}.csv"
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    print(f"  Таблица: {csv_path.resolve()}")
+    # --- 5. Сохранение датасета -------------------------------------
+    dataset_name = cfg["output"].get("dataset_name", "dataset.csv")
+    dataset_path = well_dir / dataset_name
+    df.to_csv(dataset_path, index=False, encoding="utf-8-sig")
+    print(f"  Датасет: {dataset_path.resolve()}")
 
-    # --- 7. Сегментация пластов -------------------------------------
+    # --- 6. Сегментация ---------------------------------------------
     print_section("Сегментация пластов")
-
     intervals_df = segment_all_layers(
         df,
         df.attrs["layers"],
         md_to_tvdss_fn=md_to_tvdss,
         cfg=cfg["segmentation"],
     )
+    n_res = int((intervals_df["kind"] == "reservoir").sum()) \
+        if not intervals_df.empty else 0
+    n_non = int((intervals_df["kind"] == "non_reservoir").sum()) \
+        if not intervals_df.empty else 0
+    print(f"  Всего интервалов: {len(intervals_df)} "
+          f"(reservoir: {n_res}, non_reservoir: {n_non})")
 
-    # Сводка по типам интервалов
-    print(f"\n  Всего интервалов: {len(intervals_df)}")
-    if not intervals_df.empty:
-        kind_counts = intervals_df["kind"].value_counts()
-        for kind, count in kind_counts.items():
-            print(f"    {kind}: {count}")
-
-        print("\n  Интервалы по пластам (мощности в АО):")
-        header = (f"  {'Пласт':<16} {'№':>3} {'Тип':<15} "
-                  f"{'Кровля АО':>10} {'Подошва АО':>11} "
-                  f"{'Мощн.AO':>8} {'Точек':>7}")
-        print(header)
-        print("  " + "-" * (len(header) - 2))
-        for _, r in intervals_df.iterrows():
-            print(f"  {r['layer_name']:<16} "
-                  f"{r['interval_index']:>3d} "
-                  f"{r['kind']:<15} "
-                  f"{r['top_tvdss']:>10.2f} "
-                  f"{r['bottom_tvdss']:>11.2f} "
-                  f"{r['thickness_tvdss']:>8.2f} "
-                  f"{r['n_points']:>7d}")
-
-        # --- 7b. Классификация формы (шаг D.3) --------------------------
-    # Идёт сразу после сегментации: на вход подаём все интервалы,
-    # на выходе — тот же набор + колонки form_type, confidence,
-    # reason, а также сырые признаки формы (skewness, slopes,
-    # extremum_position) для отладки и будущей визуализации.
+    # --- 7. Классификация формы -------------------------------------
     print_section("Классификация формы аномалий ПС")
-
     cls_cfg = cfg["classification"]
     cls_params = ClassificationParams.from_dict(cls_cfg)
+    print(f"  Правила: версия {cls_params.rules_version}")
 
     intervals_df = classify_intervals(
-        df,
-        intervals_df,
-        params=cls_params,
+        df, intervals_df, params=cls_params,
         smooth_window=cls_cfg.get("smooth_window", 5),
     )
-
-    # Печатаем только коллекторные интервалы — по ним форма и считается.
-    print(f"\n  Правила классификации: версия {cls_params.rules_version}")
-    print("\n  Формы коллекторных интервалов:")
-    header = (f"  {'Пласт':<16} {'№':>3} {'Форма':<17} "
-              f"{'Conf':>5}  {'Опоры (top/mid/bot)':<22}  {'Пояснение'}")
-    print(header)
-    print("  " + "-" * (len(header) - 2))
-    for _, r in intervals_df.iterrows():
-        if r["kind"] != "reservoir":
-            continue
-        ops = "—"
-        if r["sp_top"] is not None:
-            ops = (f"{r['sp_top']:.2f}/{r['sp_mid']:.2f}/"
-                   f"{r['sp_bot']:.2f}")
-        print(f"  {r['layer_name']:<16} "
-              f"{r['interval_index']:>3d} "
-              f"{r['form_type']:<17} "
-              f"{r['confidence']:>5.2f}  "
-              f"{ops:<22}  "
-              f"{r['reason']}")
-
-    # Сводка по типам форм (только коллекторы).
     res_only = intervals_df[intervals_df["kind"] == "reservoir"]
     if not res_only.empty:
-        print("\n  Распределение форм (только коллекторы):")
+        print("  Формы:")
         for ft, cnt in res_only["form_type"].value_counts().items():
             print(f"    {ft:<17} {cnt}")
 
-            # --- 7c. Размер и положение в контейнере (шаг E) ----------------
+    # --- 8. Размер и положение --------------------------------------
     print_section("Категории размера и положение в контейнере")
-
     intervals_df = classify_size_and_position(
-        df,
-        intervals_df,
-        df.attrs["layers"],
-        cfg["size_classification"],
+        df, intervals_df, df.attrs["layers"], cfg["size_classification"],
     )
+    print(f"  Интервалов с формой и размером: {len(intervals_df)}")
 
-    # Пороги относительного размера — из конфига, для справки в логе.
-    rel_small_max = cfg["size_classification"].get("relative_small_max", 0.33)
-    rel_large_min = cfg["size_classification"].get("relative_large_min", 0.67)
-
-    print(f"\n  Пороги размера (доля интервала в мощности контейнера):")
-    print(f"    small:  < {rel_small_max:.2f}")
-    print(f"    medium: {rel_small_max:.2f} … {rel_large_min:.2f}")
-    print(f"    large:  > {rel_large_min:.2f}")
-
-    # Таблица по коллекторным интервалам: форма + размер + положение.
-    print("\n  Коллекторные интервалы: форма, размер, положение:")
-    header = (f"  {'Пласт':<16} {'№':>3} {'Форма':<17} "
-              f"{'Мощн.AO':>9} {'Доля':>6} {'Размер':<8} "
-              f"{'Центроид':>9} {'Отн.':>6} {'Положение':<10}")
-    print(header)
-    print("  " + "-" * (len(header) - 2))
-    for _, r in intervals_df.iterrows():
-        if r["kind"] != "reservoir":
-            continue
-        cr = r["centroid_relative"]
-        cr_str = f"{cr:.2f}" if pd.notna(cr) else "—"
-        centr = r["centroid_tvdss"]
-        centr_str = f"{centr:>9.2f}" if pd.notna(centr) else "        —"
-        pos = r["position_in_container"] if pd.notna(r["position_in_container"]) else "—"
-        rel = r["size_relative"]
-        rel_str = f"{rel:.3f}" if pd.notna(rel) else "—"
-        print(f"  {r['layer_name']:<16} "
-              f"{r['interval_index']:>3d} "
-              f"{r['form_type']:<17} "
-              f"{r['thickness_tvdss']:>9.2f} "
-              f"{rel_str:>6} "
-              f"{r['size_class']:<8} "
-              f"{centr_str} "
-              f"{cr_str:>6} "
-              f"{pos:<10}")
-
-    # Сводки по распределениям.
-    res_only = intervals_df[intervals_df["kind"] == "reservoir"]
-    if not res_only.empty:
-        print("\n  Распределение по размеру (только коллекторы):")
-        for sc, cnt in res_only["size_class"].value_counts().items():
-            print(f"    {sc:<10} {cnt}")
-        print("\n  Распределение по положению (только коллекторы):")
-        for pc, cnt in res_only["position_in_container"].value_counts().items():
-            print(f"    {pc:<10} {cnt}")
-
-    # Сохраняем интервалы со всеми колонками (форма + размер + положение).
-    intervals_path = interim_dir / f"{well_name}_intervals_{run_id}.csv"
+    # Сохранение интервалов.
+    intervals_name = cfg["output"].get("intervals_name", "intervals.csv")
+    intervals_path = well_dir / intervals_name
     intervals_df.to_csv(intervals_path, index=False, encoding="utf-8-sig")
-    print(f"\n  Интервалы (форма + размер + положение): "
-          f"{intervals_path.resolve()}")
+    print(f"  Интервалы: {intervals_path.resolve()}")
 
-       # --- 8. Признаки пластов (уровень A) ----------------------------
+    # --- 9. Признаки уровня A ---------------------------------------
     print_section("Признаки пластов (уровень A)")
     features_df = compute_container_features(df, df.attrs["layers"])
+    print(f"  Пластов: {len(features_df)}")
 
-    print("\n  Признаки пласта-контейнера (мощности в АО):")
-    header = (f"  {'Пласт':<16} {'Мощн.AO':>9} {'Мощн.MD':>9} "
-              f"{'Точек':>7} {'SP valid':>9} {'Покрытие':>9}")
-    print(header)
-    print("  " + "-" * (len(header) - 2))
-    for _, r in features_df.iterrows():
-        th_ao = r["thickness_tvdss"] if pd.notna(r["thickness_tvdss"]) else 0
-        th_md = r["thickness_md"] if pd.notna(r["thickness_md"]) else 0
-        print(f"  {r['layer_name']:<16} "
-              f"{th_ao:>9.2f} "
-              f"{th_md:>9.2f} "
-              f"{r['n_points']:>7d} "
-              f"{r['n_sp_valid']:>9d} "
-              f"{r['sp_coverage']:>9.2f}")
-        
-        # Литологический профиль — отдельной таблицей
-    print("\n  Литологический профиль пластов (доля точек в каждом классе αПС):")
-    header2 = (f"  {'Пласт':<16} "
-               f"{'глина':>7} {'ал.глин':>8} {'алевр':>7} "
-               f"{'пес.ср':>7} {'пес.кр':>7}")
-    print(header2)
-    print("  " + "-" * (len(header2) - 2))
-    for _, r in features_df.iterrows():
-        print(f"  {r['layer_name']:<16} "
-              f"{r['pct_shale']:>7.2f} "
-              f"{r['pct_silty_shale']:>8.2f} "
-              f"{r['pct_silt']:>7.2f} "
-              f"{r['pct_sand_m']:>7.2f} "
-              f"{r['pct_sand_c']:>7.2f}")
-
-        # --- 7d. Сводная типизация пласта (шаг F) -----------------------
-    print_section("Сводная типизация пласта")
-
+    # --- 10. Сводная типизация пласта (уровень C) -------------------
+    print_section("Сводная типизация пластов")
     features_df = compute_container_types(
-        features_df,
-        intervals_df,
-        df.attrs["layers"],
-        cfg["container_type"],
+        features_df, intervals_df, df.attrs["layers"], cfg["container_type"],
     )
-
-    # Таблица по пластам: NTG, доминирующие характеристики, метка.
-    print("\n  Сводная типизация пластов:")
-    header = (f"  {'Пласт':<16} {'NTG':>6} {'N':>3} "
-              f"{'Форма':<17} {'Размер':<8} {'Положение':<10} "
-              f"{'Метка':<32}")
-    print(header)
-    print("  " + "-" * (len(header) - 2))
     for _, r in features_df.iterrows():
-        ntg = r["ntg_tvdss"] if pd.notna(r["ntg_tvdss"]) else 0.0
-        n = r["n_reservoir"] if pd.notna(r["n_reservoir"]) else 0
-        form = r["dominant_form"] if pd.notna(r["dominant_form"]) else "—"
-        size = r["dominant_size"] if pd.notna(r["dominant_size"]) else "—"
-        pos = r["dominant_position"] if pd.notna(r["dominant_position"]) else "—"
-        print(f"  {r['layer_name']:<16} "
-              f"{ntg:>6.3f} "
-              f"{n:>3d} "
-              f"{form:<17} "
-              f"{size:<8} "
-              f"{pos:<10} "
-              f"{r['container_type']:<32}")
+        print(f"    {r['layer_name']:<16} {r['container_type']}")
 
-    # Расширенное описание (человеку) — под таблицей.
-    print("\n  Расширенное описание пластов:")
-    for _, r in features_df.iterrows():
-        print(f"    {r['layer_name']:<16} {r['container_summary']}")
-
-    # Распределение типов пластов.
-    if not features_df.empty:
-        print("\n  Распределение container_type:")
-        for ct, cnt in features_df["container_type"].value_counts().items():
-            print(f"    {ct:<32} {cnt}")
-
-    features_path = interim_dir / f"{well_name}_features_{run_id}.csv"
+    # Сохранение признаков.
+    features_name = cfg["output"].get("features_name", "features.csv")
+    features_path = well_dir / features_name
     features_df.to_csv(features_path, index=False, encoding="utf-8-sig")
-    print(f"\n  Признаки (расширенные): {features_path.resolve()}")
+    print(f"  Признаки: {features_path.resolve()}")
 
-    # --- 9. Визуализация рабочего интервала -------------------------
+    # --- 11. Визуализация -------------------------------------------
     print_section("Визуализация")
-    plots_dir = Path(cfg["paths"]["results_dir"]) / "plots"
-    png_path = plots_dir / f"{well_name}_well_log_{run_id}.png"
-
-    # Интервал в TVDSS. Используем простую интерполяцию по .dev,
-    # затем переводим в Petrel-стиль: TVDSS = KB − TVD.
     kb = df_dev.attrs.get("kb", 0.0)
-
     tvd_top = float(md_to_tvd(df_dev, np.array([top_md]))[0])
     tvd_bot = float(md_to_tvd(df_dev, np.array([bottom_md]))[0])
     tvdss_top = kb - tvd_top
     tvdss_bot = kb - tvd_bot
-
-    print(f"  Рабочий интервал в TVDSS: "
-          f"{tvdss_top:.1f} … {tvdss_bot:.1f} м")
+    print(f"  Рабочий интервал в TVDSS: {tvdss_top:.1f} … {tvdss_bot:.1f} м")
 
     title = (f"Скважина {well_name}: SP + SP_norm, GK, отбивки\n"
              f"АО {tvdss_top:.0f} … {tvdss_bot:.0f} м")
 
-    # Справочный рисунок «8 типов формы — профиль — условие».
-    legend_path = plots_dir / "form_legend.png"
-    plot_form_legend(legend_path)
-
+    plot_name = cfg["output"].get("plot_name", "well_log.png")
+    png_path = well_dir / plot_name
     plot_well(
         df,
         title=title,
@@ -379,11 +220,153 @@ def main():
         classification_params=cls_params,
     )
 
-    print(f"\n  Файлы запуска {run_id}:")
-    print(f"    {csv_path.name}")
-    print(f"    {features_path.name}")
-    print(f"    {png_path.name}")
-    print(f"    {legend_path.name}")
+    return {
+        "well_name": well_name,
+        "status": "ok",
+        "features_df": features_df,
+        "files": {
+            "dataset": dataset_path,
+            "intervals": intervals_path,
+            "features": features_path,
+            "plot": png_path,
+        },
+    }
+
+
+def main():
+    # --- 1. Конфиги -------------------------------------------------
+    cfg = load_config()
+    mnem = load_mnemonic_map()
+
+    run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # --- 2. Список скважин ------------------------------------------
+    try:
+        wells = resolve_wells(cfg)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Ошибка получения списка скважин: {e}")
+        return
+
+    if not wells:
+        print("Список скважин пуст.")
+        return
+
+    # --- 3. Подготовка папки вывода ---------------------------------
+    output_dir = Path(cfg["paths"]["processed_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Легенду форм рисуем один раз — она не зависит от скважины.
+    legend_path = output_dir / "form_legend.png"
+    plot_form_legend(legend_path)
+
+    print_section(f"БАТЧ-ОБРАБОТКА — {len(wells)} скважин")
+    print(f"  Режим wells: {cfg.get('wells')!r}")
+    print(f"  Метка запуска: {run_id}")
+    print(f"  Папка вывода: {output_dir.resolve()}")
+
+    results = []
+    all_features = []
+    run_log_lines = []
+
+    # --- 4. Цикл по скважинам ---------------------------------------
+    for i, well_name in enumerate(wells, start=1):
+        print_section(f"[{i}/{len(wells)}] {well_name}")
+
+        # Всё, что печатает process_well, перехватываем в буфер.
+        # В консоль пойдёт только короткая строка отчёта.
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                result = process_well(well_name, cfg, mnem, output_dir)
+        except Exception as e:
+            result = {
+                "well_name": well_name,
+                "status": "fail",
+                "message": str(e),
+                "features_df": None,
+                "files": {},
+                "traceback": traceback.format_exc(),
+            }
+
+        well_log_text = buf.getvalue()
+
+        # Сохраняем лог по скважине (даже если была ошибка).
+        well_dir = output_dir / well_name
+        well_dir.mkdir(parents=True, exist_ok=True)
+        log_name = cfg["output"].get("log_name", "log.txt")
+        log_path = well_dir / log_name
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(well_log_text)
+            if result["status"] == "fail":
+                f.write("\n\n--- TRACEBACK ---\n")
+                f.write(result.get("traceback", ""))
+
+        # Общий лог: накапливаем.
+        run_log_lines.append(
+            f"\n{'=' * 70}\n  СКВАЖИНА {well_name}\n{'=' * 70}\n"
+        )
+        run_log_lines.append(well_log_text)
+        if result["status"] == "fail":
+            run_log_lines.append("\n--- ОШИБКА ---\n")
+            run_log_lines.append(result.get("traceback", ""))
+
+        # Короткий отчёт в консоль.
+        if result["status"] == "ok":
+            fdf = result["features_df"]
+            n_layers = len(fdf) if fdf is not None else 0
+            if fdf is not None and "ntg_tvdss" in fdf.columns:
+                n_with_sand = int((fdf["ntg_tvdss"] > 0).sum())
+            else:
+                n_with_sand = 0
+            print(f"  ✓ {well_name}: {n_layers} пластов, "
+                  f"{n_with_sand} с коллекторами")
+            print(f"    лог: {log_path.resolve()}")
+        else:
+            print(f"  ✗ {well_name}: сбой — {result['message']}")
+            print(f"    лог: {log_path.resolve()}")
+
+        results.append(result)
+
+        if result["features_df"] is not None:
+            df_w = result["features_df"].copy()
+            df_w.insert(0, "well_name", well_name)
+            all_features.append(df_w)
+
+    # --- 5. Сводная таблица по всем скважинам ------------------------
+    summary_template = cfg["output"].get(
+        "summary_name", "summary_all_wells_{ts}.csv"
+    )
+    summary_name = summary_template.format(ts=run_id)
+    summary_path = output_dir / summary_name
+
+    if all_features:
+        summary_df = pd.concat(all_features, ignore_index=True)
+        summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
+        print_section("СВОДНАЯ ТАБЛИЦА")
+        print(f"  Строк (пластов × скважин): {len(summary_df)}")
+        print(f"  Файл: {summary_path.resolve()}")
+    else:
+        print("\n  [!] Нет данных для сводной таблицы — все скважины упали.")
+
+    # --- 6. Общий лог запуска ---------------------------------------
+    run_log_template = cfg["output"].get(
+        "run_log_name", "run_log_{ts}.txt"
+    )
+    run_log_name = run_log_template.format(ts=run_id)
+    run_log_path = output_dir / run_log_name
+    with open(run_log_path, "w", encoding="utf-8") as f:
+        f.writelines(run_log_lines)
+
+    # --- 7. Итоговая сводка -----------------------------------------
+    print_section("ИТОГО")
+    n_ok = sum(1 for r in results if r["status"] == "ok")
+    n_fail = sum(1 for r in results if r["status"] == "fail")
+    print(f"  Обработано: {len(results)}")
+    print(f"  Успешно:    {n_ok}")
+    print(f"  Сбоев:      {n_fail}")
+    print(f"\n  Сводная таблица: {summary_path.resolve()}")
+    print(f"  Общий лог:       {run_log_path.resolve()}")
+    print(f"  Легенда форм:    {legend_path.resolve()}")
 
 
 if __name__ == "__main__":

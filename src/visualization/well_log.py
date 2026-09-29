@@ -114,23 +114,50 @@ def plot_well(df, title, output_path, tvdss_range=None, layers=None,
         edge_frac = classification_params.edge_frac
 
         for _, iv in intervals_df.iterrows():
-            # Рисуем только по коллекторам с определённой формой.
+            # Рисуем только по коллекторным интервалам с опорами.
             if iv.get("kind") != "reservoir":
                 continue
             if pd.isna(iv.get("sp_top")) or pd.isna(iv.get("sp_mid")) \
                or pd.isna(iv.get("sp_bot")):
                 continue
+
             form = iv.get("form_type")
-            # non_reservoir и uncertain — эталон не рисуем.
-            # uncertain означает «форму опознать не удалось»,
-            # любая линия тут была бы выдумкой.
-            if form in (None, "non_reservoir", "uncertain"):
+            if form in (None, "non_reservoir"):
                 continue
 
+            # --- Общие значения для всех веток ----------------------
+            # Определяем ДО ветвления, чтобы uncertain тоже их видел.
             top = float(iv["top_tvdss"])
             bottom = float(iv["bottom_tvdss"])
+            sp_t = float(iv["sp_top"])
+            sp_m = float(iv["sp_mid"])
+            sp_b = float(iv["sp_bot"])
 
-            # Точки интервала в отфильтрованном df.
+            # --- Ветка 1: uncertain — только три точки, без линии ---
+            # Форму опознать не удалось — рисуем три опорные точки
+            # маркерами. Никакой соединяющей линии: точка — это факт,
+            # линия была бы выдумкой.
+            if form == "uncertain":
+                span = top - bottom
+                if span > 0:
+                    positions_t = [edge_frac / 2.0, 0.5,
+                                   1.0 - edge_frac / 2.0]
+                    positions_sp = [sp_t, sp_m, sp_b]
+                    for t_rel, sp_val in zip(positions_t, positions_sp):
+                        depth_pt = top - t_rel * span
+                        ax2.plot(
+                            [sp_val], [depth_pt],
+                            marker="o", markersize=4,
+                            markerfacecolor="white",
+                            markeredgecolor="black",
+                            markeredgewidth=1.0,
+                            linestyle="none",
+                            zorder=6,
+                        )
+                # Обязательно continue — не даём коду рисовать линию.
+                continue
+
+            # --- Ветка 2: остальные типы — эталонная кривая --------
             mask = (df["depth_tvdss"] <= top) & \
                    (df["depth_tvdss"] >= bottom)
             sub = df.loc[mask, "depth_tvdss"]
@@ -142,9 +169,9 @@ def plot_well(df, title, output_path, tvdss_range=None, layers=None,
                 depth_tvdss=d,
                 top_tvdss=top,
                 bottom_tvdss=bottom,
-                sp_top=float(iv["sp_top"]),
-                sp_mid=float(iv["sp_mid"]),
-                sp_bot=float(iv["sp_bot"]),
+                sp_top=sp_t,
+                sp_mid=sp_m,
+                sp_bot=sp_b,
                 edge_frac=edge_frac,
                 form_type=form,
             )

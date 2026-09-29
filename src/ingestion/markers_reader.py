@@ -90,11 +90,25 @@ def read_markers(path, well_name, config):
     # чтобы пласты шли сверху вниз.
     result = result.sort_values("md").reset_index(drop=True)
 
-    # --- Фильтр по списку маркеров (если задан) -------------------
+        # --- Фильтр по маркерам ---------------------------------------
+    # Режимы:
+    #   "all"        — все маркеры как есть;
+    #   "tops_only"  — только оканчивающиеся на "_TOP_S" (кровли);
+    #   [список]     — только эти имена.
+    #
+    # Пласты в проекте задаются кровлями. Подошвы (_BOT_S, _BOT)
+    # либо дублируют следующую кровлю, либо не несут полезной
+    # информации и только мешают.
     markers_to_use = config.get("markers_to_use", "all")
-    if markers_to_use != "all":
-        result = result[result["marker_name"].isin(markers_to_use)]
-        result = result.reset_index(drop=True)
+
+    if markers_to_use == "tops_only":
+        result = result[
+            result["marker_name"].astype(str).str.endswith("_TOP_S")
+        ].reset_index(drop=True)
+    elif markers_to_use != "all":
+        result = result[
+            result["marker_name"].isin(markers_to_use)
+        ].reset_index(drop=True)
 
     # --- Убираем строки без MD -----------------------------------
     result = result.dropna(subset=["md"]).reset_index(drop=True)
