@@ -1,38 +1,41 @@
+# -*- coding: utf-8 -*-
 """
-Сегментация пласта-контейнера на интервалы коллектор/неколлектор.
+Сегментация пласта-контейнера на интервалы коллектор / неколлектор.
 
 См. docs/FEATURES.md, раздел 5.
 
 Алгоритм:
-    1. Сгладить aSP скользящим средним (окно из config).
-    2. Применить порог aSP > threshold → reservoir (aSP: 1 = песок).
+    1. Сгладить aSP скользящим средним (окно из config:
+       preprocessing.smooth_window).
+    2. Применить порог aSP > cutoff → reservoir (aSP: 1 = песок).
+       Порог — reservoir.cutoff из config.
     3. Собрать непрерывные интервалы с одинаковой меткой.
-    4. Объединить интервалы < min_thickness_m с соседями (по большинству).
+    4. Объединить интервалы мощностью меньше reservoir.min_thickness_tvdss
+       с соседями (по большинству).
 
 Правила:
-    - Минимальная мощность интервала — min_thickness_m (по умолчанию 1 м).
     - Все границы интервалов пересчитываются в TVDSS через интерполяцию
       по .dev. Мощность считаем в абсолютных отметках.
-    - Если пласт полностью глинистый или полностью песчаный — возвращаем
-      один интервал соответствующего типа.
+    - Если пласт полностью глинистый или полностью песчаный —
+      возвращаем один интервал соответствующего типа.
 """
-import pandas as pd  
-import numpy as np
-from dataclasses import dataclass
 
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
 
 
 @dataclass
 class Interval:
     """Один непрерывный интервал внутри пласта."""
-    kind: str             # "reservoir" | "non_reservoir"
-    top_md: float         # кровля, м MD
-    bottom_md: float      # подошва, м MD
-    top_tvdss: float      # кровля в АО, м
-    bottom_tvdss: float   # подошва в АО, м
-    thickness_md: float   # мощность по стволу, м
+    kind: str               # "reservoir" | "non_reservoir"
+    top_md: float           # кровля, м MD
+    bottom_md: float        # подошва, м MD
+    top_tvdss: float        # кровля в АО, м
+    bottom_tvdss: float     # подошва в АО, м
+    thickness_md: float     # мощность по стволу, м
     thickness_tvdss: float  # мощность в АО, м  ← главная
-    n_points: int         # сколько точек каротажа внутри
+    n_points: int           # сколько точек каротажа внутри
 
 
 def smooth(values, window):
@@ -66,26 +69,26 @@ def smooth(values, window):
     return result
 
 
-def _label_points(sp_smoothed, threshold):
+def _label_points(asp_smoothed, cutoff):
     """
-    Присваивает каждой точке метку reservoir/non_reservoir.
+    Присваивает каждой точке метку reservoir / non_reservoir.
 
     Параметры:
-        sp_smoothed : np.ndarray — сглаженная aSP (NaN где данных нет)
-        threshold   : float      — порог aSP (обычно 0.4)
+        asp_smoothed : np.ndarray — сглаженная aSP (NaN где нет данных)
+        cutoff       : float      — порог aSP (обычно 0.4)
 
     Возвращает:
         np.ndarray[object] — метки: "reservoir", "non_reservoir" или None.
-        None там, где sp_smoothed = NaN.
+        None там, где asp_smoothed = NaN.
 
     Правило (aSP: 0 = глина, 1 = песок):
-        aSP > threshold → reservoir (песчаник),
-        aSP ≤ threshold → non_reservoir (глина).
+        aSP > cutoff  → reservoir (песчаник),
+        aSP ≤ cutoff  → non_reservoir (глина).
     """
-    labels = np.full(len(sp_smoothed), None, dtype=object)
-    valid = ~np.isnan(sp_smoothed)
-    labels[valid & (sp_smoothed > threshold)] = "reservoir"
-    labels[valid & (sp_smoothed <= threshold)] = "non_reservoir"
+    labels = np.full(len(asp_smoothed), None, dtype=object)
+    valid = ~np.isnan(asp_smoothed)
+    labels[valid & (asp_smoothed > cutoff)] = "reservoir"
+    labels[valid & (asp_smoothed <= cutoff)] = "non_reservoir"
     return labels
 
 
@@ -163,8 +166,7 @@ def _merge_small_intervals(intervals, min_points):
         (нет обоих соседей) — присоединяем к единственному.
 
         Крайний случай: пласт целиком короче min_points —
-        возвращаем как есть, тип остаётся исходный. Это пласт
-        попадёт в отдельную категорию "micro", но пока не трогаем.
+        возвращаем как есть, тип остаётся исходный.
     """
     if not intervals:
         return intervals
@@ -226,6 +228,7 @@ def _merge_small_intervals(intervals, min_points):
 
     return result
 
+
 def _merge_adjacent_same_type(intervals):
     """
     Объединяет соседние интервалы одного типа.
@@ -259,38 +262,47 @@ def _merge_adjacent_same_type(intervals):
 
     return result
 
+
 def segment_layer(
     depth_md,
     asp_values,
     top_tvdss_container,
     bottom_tvdss_container,
     md_to_tvdss_fn,
-    cutoff=0.4,
-    smooth_window=5,
-    min_thickness_tvdss=1.0,
+    cutoff,
+    smooth_window,
+    min_thickness_tvdss,
 ):
     """
     Сегментирует один пласт-контейнер.
 
-    Параметры:
-        depth_md              : np.ndarray — глубины по стволу, м MD
-        asp_values : np.ndarray — aSP (0..1), NaN где нет данных
-        top_tvdss_container   : float — кровля пласта в АО
-        bottom_tvdss_container: float — подошва пласта в АО
-        md_to_tvdss_fn        : callable — функция перевода MD → TVDSS
-        threshold             : float — порог aSP для коллектора
-        smooth_window         : int — окно сглаживания в точках
-        min_thickness_tvdss   : float — минимальная мощность интервала в АО, м
+    Параметры
+    ---------
+    depth_md : np.ndarray
+        Глубины по стволу, м MD.
+    asp_values : np.ndarray
+        aSP (0 = глина, 1 = песок), NaN где нет данных.
+    top_tvdss_container, bottom_tvdss_container : float
+        Кровля и подошва пласта в АО, м.
+    md_to_tvdss_fn : callable
+        Функция перевода MD → TVDSS.
+    cutoff : float
+        Порог aSP: aSP > cutoff → коллектор.
+    smooth_window : int
+        Окно сглаживания aSP в точках.
+    min_thickness_tvdss : float
+        Минимальная мощность интервала в АО, м.
 
-    Возвращает:
-        list[Interval] — сегменты пласта, отсортированные сверху вниз.
-        Пустой список — если в пласте нет валидных точек aSP.
+    Возвращает
+    ----------
+    list[Interval] — сегменты пласта, отсортированные сверху вниз.
+    Пустой список — если в пласте нет валидных точек aSP.
     """
     # --- 1. Сглаживание ---------------------------------------------
-    sp_smoothed = smooth(asp_values, smooth_window)
+    asp_smoothed = smooth(asp_values, smooth_window)
 
     # --- 2. Метки ---------------------------------------------------
-    labels = _label_points(sp_smoothed, cutoff)
+    labels = _label_points(asp_smoothed, cutoff)
 
     # --- 3. Сырые интервалы -----------------------------------------
     raw = _build_raw_intervals(depth_md, labels)
@@ -298,20 +310,19 @@ def segment_layer(
         return []
 
     # --- 4. Минимальный размер в точках -----------------------------
-    # Оцениваем шаг каротажа: медиана разницы между соседними MD
+    # Оцениваем шаг каротажа: медиана разницы между соседними MD.
     if len(depth_md) >= 2:
         step = float(np.median(np.diff(depth_md)))
     else:
         step = 0.1  # fallback
 
-    # min_points: сколько точек нужно, чтобы мощность была >= min_thickness
-    # Простая оценка: min_thickness / step. Так как мы работаем в MD,
-    # а min_thickness задан в АО, для наклонных стволов MD-мощность
-    # немного больше АО. Берём с запасом снизу — то есть
+    # min_points: сколько точек нужно, чтобы мощность была >= min_thickness.
+    # Работаем в MD, а min_thickness задан в АО. Для наклонных стволов
+    # MD-мощность немного больше АО. Берём с запасом снизу — то есть
     # min_points = ceil(min_thickness / step). Строго по АО проверим позже.
     min_points = max(1, int(np.ceil(min_thickness_tvdss / step)))
 
-     # --- 5. Слияние мелких ------------------------------------------
+    # --- 5. Слияние мелких ------------------------------------------
     merged = _merge_small_intervals(raw, min_points)
 
     # --- 5b. Слияние соседних одного типа ---------------------------
@@ -344,25 +355,38 @@ def segment_layer(
     return result
 
 
-def segment_all_layers(df, layers, md_to_tvdss_fn, cfg):
+def segment_all_layers(
+    df,
+    layers,
+    md_to_tvdss_fn,
+    cutoff,
+    smooth_window,
+    min_thickness_tvdss,
+):
     """
     Прогоняет сегментацию по всем пластам скважины.
 
-    Параметры:
-        df              : pd.DataFrame из build_dataset
-        layers          : list[dict] из df.attrs["layers"]
-        md_to_tvdss_fn  : callable — MD → TVDSS
-        cfg             : dict — секция segmentation из config.yaml
+    Параметры
+    ---------
+    df : pd.DataFrame
+        Из build_dataset. Нужны колонки: layer_name, depth_md, aSP.
+    layers : list[dict]
+        Из df.attrs["layers"].
+    md_to_tvdss_fn : callable
+        Функция перевода MD → TVDSS.
+    cutoff : float
+        Порог aSP для коллектора (обычно 0.4).
+    smooth_window : int
+        Окно сглаживания aSP в точках (обычно 5).
+    min_thickness_tvdss : float
+        Минимальная мощность интервала в АО, м (обычно 1.0).
 
-    Возвращает:
-        pd.DataFrame — одна строка на интервал:
-            layer_name, interval_index, kind, top_md, bottom_md,
-            top_tvdss, bottom_tvdss, thickness_md, thickness_tvdss, n_points
+    Возвращает
+    ----------
+    pd.DataFrame — одна строка на интервал:
+        layer_name, interval_index, kind, top_md, bottom_md,
+        top_tvdss, bottom_tvdss, thickness_md, thickness_tvdss, n_points
     """
-    cutoff = cfg.get("cutoff", 0.4)
-    smooth_window = cfg.get("smooth_window", 5)
-    min_thickness_tvdss = cfg.get("min_thickness_tvdss", 1.0)
-
     rows = []
 
     for lay in layers:
@@ -403,5 +427,3 @@ def segment_all_layers(df, layers, md_to_tvdss_fn, cfg):
 
     result = pd.DataFrame(rows)
     return result
-
-

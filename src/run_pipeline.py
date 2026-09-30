@@ -140,7 +140,9 @@ def process_well(well_name, cfg, mnem, output_dir):
         df,
         df.attrs["layers"],
         md_to_tvdss_fn=md_to_tvdss,
-        cfg=cfg["segmentation"],
+        cutoff=cfg["reservoir"]["cutoff"],
+        smooth_window=cfg["preprocessing"]["smooth_window"],
+        min_thickness_tvdss=cfg["reservoir"]["min_thickness_tvdss"],
     )
     n_res = int((intervals_df["kind"] == "reservoir").sum()) \
         if not intervals_df.empty else 0
@@ -151,13 +153,19 @@ def process_well(well_name, cfg, mnem, output_dir):
 
     # --- 7. Классификация формы -------------------------------------
     print_section("Классификация формы аномалий ПС")
-    cls_cfg = cfg["classification"]
+
+    # Параметры классификатора собираются из двух секций config:
+    #   • classification — правила формы
+    #   • reservoir     — общий порог коллектора (одинаковый
+    #                     с сегментацией)
+    cls_cfg = dict(cfg["classification"])
+    cls_cfg["reservoir_cutoff"] = cfg["reservoir"]["cutoff"]
     cls_params = ClassificationParams.from_dict(cls_cfg)
     print(f"  Правила: версия {cls_params.rules_version}")
 
     intervals_df = classify_intervals(
         df, intervals_df, params=cls_params,
-        smooth_window=cls_cfg.get("smooth_window", 5),
+        smooth_window=cfg["preprocessing"]["smooth_window"],
     )
     res_only = intervals_df[intervals_df["kind"] == "reservoir"]
     if not res_only.empty:
@@ -178,9 +186,12 @@ def process_well(well_name, cfg, mnem, output_dir):
     intervals_df.to_csv(intervals_path, index=False, encoding="utf-8-sig")
     print(f"  Интервалы: {intervals_path.resolve()}")
 
-    # --- 9. Признаки уровня A ---------------------------------------
+        # --- 9. Признаки уровня A ---------------------------------------
     print_section("Признаки пластов (уровень A)")
-    features_df = compute_container_features(df, df.attrs["layers"])
+    features_df = compute_container_features(
+        df, df.attrs["layers"],
+        smooth_window=cfg["preprocessing"]["smooth_window"],
+    )
     print(f"  Пластов: {len(features_df)}")
 
     # --- 10. Сводная типизация пласта (уровень C) -------------------
@@ -215,6 +226,7 @@ def process_well(well_name, cfg, mnem, output_dir):
         df,
         title=title,
         output_path=png_path,
+        reservoir_cutoff=cfg["reservoir"]["cutoff"],
         tvdss_range=(tvdss_top, tvdss_bot),
         layers=df.attrs.get("layers", []),
         intervals_df=intervals_df,
@@ -258,7 +270,7 @@ def main():
 
     # Легенду форм рисуем один раз — она не зависит от скважины.
     legend_path = output_dir / "form_legend.png"
-    plot_form_legend(legend_path)
+    plot_form_legend(legend_path, cutoff=cfg["reservoir"]["cutoff"])
 
     print_section(f"БАТЧ-ОБРАБОТКА — {len(wells)} скважин")
     print(f"  Режим wells: {cfg.get('wells')!r}")

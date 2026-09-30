@@ -1,11 +1,11 @@
+# -*- coding: utf-8 -*-
 """
 Расчёт признаков пласта-контейнера (уровень A).
 
 См. docs/FEATURES.md, раздел 4.
 
-Пока — только признаки уровня A (по пласту целиком).
-Признаки уровня B (по каждому коллекторному интервалу) —
-после реализации сегментации (шаг C).
+Признаки уровня A — по пласту целиком: статистика точек,
+литологический профиль по классам αПС.
 """
 
 import numpy as np
@@ -41,7 +41,8 @@ def layer_stats(df_layer):
         "sp_coverage": n_valid / n if n > 0 else 0.0,
     }
 
-def compute_lithology_profile(asp_values, smooth_window=5):
+
+def compute_lithology_profile(asp_values, smooth_window):
     """
     Считает доли точек в каждом из пяти классов αПС.
 
@@ -55,12 +56,14 @@ def compute_lithology_profile(asp_values, smooth_window=5):
     Сглаживание — для устойчивости (одиночные точки на границе
     корзин дают шум).
 
-    Параметры:
-        asp_values : np.ndarray — aSP пласта (с NaN)
-        smooth_window  : int — окно сглаживания
+    Параметры
+    ---------
+    asp_values : np.ndarray — aSP пласта (с NaN)
+    smooth_window : int — окно сглаживания в точках
 
-    Возвращает:
-        dict с пятью ключами pct_*, сумма = 1.0 (или 0.0, если нет данных).
+    Возвращает
+    ----------
+    dict с пятью ключами pct_*, сумма = 1.0 (или 0.0, если нет данных).
     """
     arr = np.asarray(asp_values, dtype=float)
     smoothed = smooth(arr, smooth_window)
@@ -85,18 +88,24 @@ def compute_lithology_profile(asp_values, smooth_window=5):
         "pct_sand_c":      float(np.sum(valid >= 0.8) / n),
     }
 
-def compute_container_features(df, layers):
+
+def compute_container_features(df, layers, smooth_window):
     """
     Считает признаки уровня A для всех пластов скважины.
 
-    Параметры:
-        df     : pd.DataFrame из build_dataset
-                 (содержит depth_md, aSP, layer_name)
-        layers : list[dict] из df.attrs["layers"]
-                 (в каждом — top_md, bottom_md, top_tvdss, ...)
+    Параметры
+    ---------
+    df : pd.DataFrame
+        Из build_dataset. Нужны колонки: depth_md, aSP, layer_name.
+    layers : list[dict]
+        Из df.attrs["layers"] (top_md, bottom_md, top_tvdss, ...).
+    smooth_window : int
+        Окно сглаживания aSP для литопрофиля (в точках).
+        Берётся из config: preprocessing.smooth_window.
 
-    Возвращает:
-        pd.DataFrame, одна строка на пласт.
+    Возвращает
+    ----------
+    pd.DataFrame, одна строка на пласт.
     """
     rows = []
 
@@ -114,7 +123,7 @@ def compute_container_features(df, layers):
             sp = df_lay["aSP"].to_numpy(dtype=float)
         else:
             sp = np.array([])
-        litho = compute_lithology_profile(sp, smooth_window=5)
+        litho = compute_lithology_profile(sp, smooth_window=smooth_window)
 
         rows.append({
             "layer_name":      name,

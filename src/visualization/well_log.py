@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Визуализация одной скважины: кривые SP и GK с наложенными отбивками
 и колонкой интервалов (коллектор / неколлектор).
@@ -24,32 +25,41 @@ from src.visualization.form_legend import FORM_COLORS
 RESERVOIR_COLOR = "#4CAF50"       # зелёный — reservoir
 NON_RESERVOIR_COLOR = "#E0E0E0"   # светло-серый — non_reservoir
 
-# Порог коллектора по aSP (0=глина, 1=песок).
-# Совпадает с segmentation.cutoff из config.yaml.
-ASP_RESERVOIR_THRESHOLD = 0.4
+# Порог коллектора теперь передаётся параметром функции plot_well
+# (из config: reservoir.cutoff). Константа убрана, чтобы не было
+# скрытых хардкодов.
 
 
-def plot_well(df, title, output_path, tvdss_range=None, layers=None,
+def plot_well(df, title, output_path, reservoir_cutoff,
+              tvdss_range=None, layers=None,
               intervals_df=None, classification_params=None):
     """
     Рисует разрез. Ось Y — TVDSS (абсолютные отметки).
 
     Параметры
     ---------
-    df           : pd.DataFrame из build_dataset
-                (колонки depth_tvdss, SP, aSP, GK, GK_norm)
-    title        : заголовок
-    output_path  : куда сохранить PNG
-    tvdss_range  : (top_tvdss, bottom_tvdss) или None.
-                   Фильтр видимого диапазона по АО.
-    layers       : list[dict] из df.attrs["layers"]
-    intervals_df : pd.DataFrame из segment_all_layers / classify_intervals.
-                   Если в нём есть колонки sp_top, sp_mid, sp_bot,
-                   form_type — на панели αПС будут наложены эталонные
-                   кривые соответствующих форм.
+    df : pd.DataFrame
+        Из build_dataset. Нужны колонки: depth_tvdss, SP, aSP,
+        GK, GK_norm.
+    title : str
+        Заголовок.
+    output_path : str | Path
+        Куда сохранить PNG.
+    reservoir_cutoff : float
+        Порог коллектора по aSP (обычно 0.4).
+        Рисуется вертикальной штриховой линией на треке aSP.
+        Берётся из config: reservoir.cutoff.
+    tvdss_range : (top_tvdss, bottom_tvdss) | None
+        Фильтр видимого диапазона по АО.
+    layers : list[dict]
+        Из df.attrs["layers"].
+    intervals_df : pd.DataFrame | None
+        Из segment_all_layers / classify_intervals. Если в нём есть
+        колонки sp_top, sp_mid, sp_bot, form_type — на панели aSP
+        будут наложены эталонные кривые соответствующих форм.
     classification_params : ClassificationParams | None
-                   Нужен для edge_frac (позиции опорных зон).
-                   Если None — эталонные кривые не рисуются.
+        Нужен для edge_frac (позиции опорных зон).
+        Если None — эталонные кривые не рисуются.
     """
     # --- Фильтрация по TVDSS ----------------------------------------
     if tvdss_range is not None:
@@ -95,16 +105,16 @@ def plot_well(df, title, output_path, tvdss_range=None, layers=None,
     # (у SP высокое значение = глина = справа).
     ax2.set_xlim(1, 0)
     # Порог коллектора — вертикальная штриховая линия.
-    ax2.axvline(x=ASP_RESERVOIR_THRESHOLD, color="tab:red",
+    ax2.axvline(x=reservoir_cutoff, color="tab:red",
                 lw=0.7, ls="--", alpha=0.5)
     ax2.set_xlabel("aSP (1=песок, 0=глина)",
                    color="tab:red", fontsize=8)
     ax2.tick_params(axis="x", labelcolor="tab:red", labelsize=8)
 
-    # --- Эталонные кривые αПС по типам формы ------------------------
+    # --- Эталонные кривые aSP по типам формы ------------------------
     # Для каждого reservoir-интервала, у которого классификация дала
-    # конкретную форму, строим «идеальную» αПС и рисуем её штриховой
-    # линией поверх реальной. Цвет — из общей палитры FORM_COLORS.
+    # конкретную форму, строим «идеальную» кривую и рисуем её
+    # штриховой линией поверх реальной. Цвет — из FORM_COLORS.
     if (
         classification_params is not None
         and intervals_df is not None
@@ -127,7 +137,6 @@ def plot_well(df, title, output_path, tvdss_range=None, layers=None,
                 continue
 
             # --- Общие значения для всех веток ----------------------
-            # Определяем ДО ветвления, чтобы uncertain тоже их видел.
             top = float(iv["top_tvdss"])
             bottom = float(iv["bottom_tvdss"])
             sp_t = float(iv["sp_top"])
@@ -136,7 +145,7 @@ def plot_well(df, title, output_path, tvdss_range=None, layers=None,
 
             # --- Ветка 1: uncertain — только три точки, без линии ---
             # Форму опознать не удалось — рисуем три опорные точки
-            # маркерами. Никакой соединяющей линии: точка — это факт,
+            # маркерами. Никакой соединяющей линии: точка — факт,
             # линия была бы выдумкой.
             if form == "uncertain":
                 span = top - bottom
@@ -155,7 +164,6 @@ def plot_well(df, title, output_path, tvdss_range=None, layers=None,
                             linestyle="none",
                             zorder=6,
                         )
-                # Обязательно continue — не даём коду рисовать линию.
                 continue
 
             # --- Ветка 2: остальные типы — эталонная кривая --------

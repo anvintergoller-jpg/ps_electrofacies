@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Классификация формы аномалии ПС для коллекторных интервалов (шаг D.3).
+Классификация формы аномалии ПС для коллекторных интервалов.
 
 Источник правил: docs/CLASSIFICATION_RULES.md (версия 2.0).
 
@@ -12,7 +12,7 @@
 
 Шкала aSP (alpha-PS): ~0.0 = глина, ~1.0 = чистый песчаник.
 
-Типы форм (7):
+Типы форм:
     cylinder          — ровное плато на песчаном уровне
     bell              — глина сверху, песок снизу
     funnel            — песок сверху, глина снизу
@@ -51,8 +51,18 @@ RULES_VERSION = "2.0"
 @dataclass
 class ClassificationParams:
     """
-    Набор параметров классификации. Значения по умолчанию совпадают
-    с секцией `classification` в config/config.yaml.
+    Параметры классификации формы одного интервала.
+
+    Поля условно делятся на две группы:
+
+    • Правила формы (из секции classification в config.yaml):
+      edge_frac, threshold_diff, plateau_threshold, slope_threshold,
+      core_threshold, frac_core_trapezoid, frac_core_v_shape,
+      min_points, smooth_window.
+
+    • Общий порог коллектора (из секции reservoir в config.yaml):
+      reservoir_cutoff — общий с сегментацией. Обязательный параметр,
+      дефолт намеренно отсутствует, чтобы нельзя было его забыть.
     """
     edge_frac: float = 0.15
     threshold_diff: float = 0.20
@@ -62,18 +72,43 @@ class ClassificationParams:
     frac_core_trapezoid: float = 0.40
     frac_core_v_shape: float = 0.15
     min_points: int = 5
-    reservoir_cutoff: float = 0.60
+
+    # Обязательный параметр — приходит из секции reservoir.
+    # None означает «не передан», from_dict() это проверяет.
+    reservoir_cutoff: Optional[float] = None
+
     smooth_window: int = 5
     rules_version: str = RULES_VERSION
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "ClassificationParams":
-        """Собрать параметры из словаря (секция `classification`)."""
+        """
+        Собрать параметры из словаря.
+
+        Ожидает объединённый словарь из секций
+        `classification` (правила формы) и `reservoir`
+        (reservoir_cutoff). Значения из `reservoir` нужно добавить
+        в словарь перед вызовом — см. run_pipeline.py.
+
+        Ошибка, если reservoir_cutoff не задан: хотим падать громко,
+        а не тихо использовать устаревший дефолт.
+        """
         if not d:
-            return cls()
+            raise ValueError(
+                "ClassificationParams.from_dict: пустой словарь. "
+                "Проверьте секции classification и reservoir "
+                "в config.yaml."
+            )
         known = {f.name for f in fields(cls)}
         filtered = {k: v for k, v in d.items() if k in known}
-        return cls(**filtered)
+        obj = cls(**filtered)
+
+        if obj.reservoir_cutoff is None:
+            raise ValueError(
+                "ClassificationParams: не задан reservoir_cutoff. "
+                "Добавьте его из секции reservoir в config.yaml."
+            )
+        return obj
 
 
 # ===========================================================================
@@ -151,13 +186,15 @@ def _has_multiple_minima(
     Проверка переслаивания: два и более УСТОЙЧИВЫХ захода в песок,
     разделённых устойчивым глинистым участком.
 
-    Устойчивый = длиной ≥ min_run_length точек.
-    Это фильтрует шум — одиночные точки выше/ниже cutoff не считаются.
+    Устойчивый = длиной ≥ min_run_length точек. Фильтрует шум.
+
+    ⚠ Функция сейчас НЕ подключена к правилам (см. ADR-002).
+    Оставлена для будущей доработки сегментации.
 
     Параметры
     ---------
-    values : последовательность float
-    cutoff : float — порог aSP (0.40)
+    values : последовательность float — aSP (0 = глина, 1 = песок)
+    cutoff : float — порог aSP (0.40): значения > cutoff — песок
     min_run_length : int — минимальная длина «полки» (5 точек)
 
     Возвращает True, если найдено ≥ 2 устойчивых песчаных «полки».
@@ -166,8 +203,9 @@ def _has_multiple_minima(
     if n < 2 * min_run_length + 1:
         return False
 
-    # Сжимаем в последовательность меток: True — песок, False — глина.
-    is_sand = [v < cutoff for v in values]
+    # В aSP песок — это ВЫСОКИЕ значения (близко к 1).
+    # Логика инвертирована относительно старой SP_norm-шкалы.
+    is_sand = [v > cutoff for v in values]
 
     # Ищем непрерывные «полки» песка длиной ≥ min_run_length.
     sand_runs = 0
@@ -193,11 +231,18 @@ def _has_multiple_minima(
 
 def classify_form(
     sp_smooth: Sequence[float],
-    params: Optional[ClassificationParams] = None,
-    config: Optional[dict] = None,
+    params: ClassificationParams,
 ) -> dict:
     """
     Определить форму одного коллекторного интервала.
+
+    Параметры
+    ---------
+    sp_smooth : последовательность float
+        Сглаженные значения aSP для точек интервала, сверху вниз.
+        NaN допустимы — они отфильтруются внутри.
+    params : ClassificationParams
+        Параметры классификации (обязательно, без дефолта).
 
     Возвращает dict с полями:
         form_type         — тип формы
@@ -208,9 +253,6 @@ def classify_form(
         frac_core         — доля точек в ядре вокруг sp_mid
         n_points, rules_version
     """
-    if params is None:
-        params = ClassificationParams.from_dict(config)
-
     clean = _clean(sp_smooth)
     n = len(clean)
 
@@ -249,9 +291,8 @@ def classify_form(
     frac_core = _compute_frac_core(clean, sp_mid, params.core_threshold)
     result["frac_core"] = frac_core
 
-    cutoff = params.reservoir_cutoff  # 0.40 в шкале aSP
-
-    cutoff = params.reservoir_cutoff  # 0.40 в шкале aSP
+    # Порог коллектора по aSP. Обязательный параметр из секции reservoir.
+    cutoff = params.reservoir_cutoff
 
     # -------------------------------------------------------------------
     # Шаг 2. M-форма (переслаивание)
@@ -275,8 +316,6 @@ def classify_form(
     # -------------------------------------------------------------------
     # Шаг 3. Цилиндр: ровное плато на песчаном уровне
     # -------------------------------------------------------------------
-    # Все три опоры в песчаной зоне (aSP > cutoff) и близко друг к другу.
-    # frac_core — широкое ядро вокруг sp_mid (высокий aSP).
     if (
         sp_top > cutoff
         and sp_mid > cutoff
@@ -292,7 +331,6 @@ def classify_form(
     # -------------------------------------------------------------------
     # Шаг 4. Глина — песок — глина (symmetric / trapezoid-middle / v-shape)
     # -------------------------------------------------------------------
-    # Верх и низ — глинистые (низкие aSP), центр — песчаный (высокий aSP).
     top_bot_close = abs(diff_top_bot) < params.threshold_diff
     mid_is_high = (
         sp_mid > sp_top + params.slope_threshold
@@ -319,8 +357,6 @@ def classify_form(
     # -------------------------------------------------------------------
     # Шаг 5. Bell: глина сверху, песок снизу
     # -------------------------------------------------------------------
-    # В aSP: sp_top низкий (глина), sp_bot высокий (песок)
-    # → diff_top_bot = sp_top − sp_bot < −threshold.
     if diff_top_bot < -params.threshold_diff:
         conf = min(1.0, abs(diff_top_bot) / params.threshold_diff - 0.5)
         result["form_type"] = "bell"
@@ -331,8 +367,6 @@ def classify_form(
     # -------------------------------------------------------------------
     # Шаг 6. Funnel: песок сверху, глина снизу
     # -------------------------------------------------------------------
-    # sp_top высокий (песок), sp_bot низкий (глина)
-    # → diff_top_bot > +threshold.
     if diff_top_bot > params.threshold_diff:
         conf = min(1.0, diff_top_bot / params.threshold_diff - 0.5)
         result["form_type"] = "funnel"
@@ -357,7 +391,7 @@ def classify_intervals(
     df: pd.DataFrame,
     intervals_df: pd.DataFrame,
     params: ClassificationParams,
-    smooth_window: int = 5,
+    smooth_window: int,
 ) -> pd.DataFrame:
     """
     Прогнать классификацию по всем интервалам скважины.
