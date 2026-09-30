@@ -71,7 +71,7 @@ def read_markers(path, well_name, config):
             f"В файле {path} нет строк для скважины '{well_name}'"
         )
 
-    # --- Собираем результат ---------------------------------------
+        # --- Собираем результат ---------------------------------------
     result = pd.DataFrame({
         "marker_name": df[name_col].astype(str).str.strip(),
         # pd.to_numeric с errors="coerce" — если ячейка вдруг текст,
@@ -84,6 +84,18 @@ def read_markers(path, well_name, config):
         result["tvdss"] = pd.to_numeric(df[tvdss_col], errors="coerce")
     else:
         result["tvdss"] = np.nan
+
+    # X, Y, Z — координаты кровли. Нужны для выгрузки в Petrel.
+    # Если колонки нет — заполняем NaN.
+    x_col = config.get("x_column_name", "X")
+    y_col = config.get("y_column_name", "Y")
+    z_col = config.get("z_column_name", "Z")
+
+    for key, col_name in [("x", x_col), ("y", y_col), ("z", z_col)]:
+        if col_name in df.columns:
+            result[key] = pd.to_numeric(df[col_name], errors="coerce")
+        else:
+            result[key] = np.nan
 
     # --- Сортировка по MD ----------------------------------------
     # Petrel не гарантирует порядок строк. Сортируем сами,
