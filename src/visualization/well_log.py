@@ -166,7 +166,32 @@ def plot_well(df, title, output_path, reservoir_cutoff,
                         )
                 continue
 
-            # --- Ветка 2: остальные типы — эталонная кривая --------
+                       # --- Ветка 2: v3.0-формы — пока не рисуем эталон -----
+            # build_reference_curve знает только v2.x-формы. Для
+            # trapezoid-top / trapezoid-bottom / unknown-shape
+            # корректной эталонной кривой пока нет. Рисуем три
+            # опорные точки маркерами — как для uncertain раньше.
+            if form in ("trapezoid-top", "trapezoid-bottom",
+                        "unknown-shape", "uncertain"):
+                span = top - bottom
+                if span > 0:
+                    positions_t = [edge_frac / 2.0, 0.5,
+                                   1.0 - edge_frac / 2.0]
+                    positions_sp = [sp_t, sp_m, sp_b]
+                    for t_rel, sp_val in zip(positions_t, positions_sp):
+                        depth_pt = top - t_rel * span
+                        ax2.plot(
+                            [sp_val], [depth_pt],
+                            marker="o", markersize=4,
+                            markerfacecolor="white",
+                            markeredgecolor="black",
+                            markeredgewidth=1.0,
+                            linestyle="none",
+                            zorder=6,
+                        )
+                continue
+
+            # --- Ветка 3: остальные v2.x-формы — эталонная кривая --
             mask = (df["depth_tvdss"] <= top) & \
                    (df["depth_tvdss"] >= bottom)
             sub = df.loc[mask, "depth_tvdss"]

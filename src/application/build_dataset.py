@@ -106,6 +106,21 @@ def build_dataset(df_las, df_dev, df_markers, cfg, well_name, mnem_cfg=None):
     # DEPTH больше не нужен — есть depth_md
     df = df.drop(columns=["DEPTH"])
 
+
+    # --- 4.5. Дискретный лог aSP_disc (классы Муромцева) ------------
+    # 5 классов αПС + склейка коротких сегментов по TVDSS.
+    # Используется в классификации формы v3.0 (плато, границы
+    # элементов). Требует, чтобы aSP уже был в df — он появляется
+    # после normalize_curves, до вызова build_dataset.
+    # См. docs/CLASSIFICATION_RULES_v3.md, §10.
+    from src.preprocessing.discrete_log import compute_asp_disc
+
+    min_class_thickness = (
+        cfg["classification_v3"]["min_class_thickness_tvdss"]
+    )
+    df["aSP_disc"] = compute_asp_disc(df, min_class_thickness)
+
+
     # --- 5. Список пластов из отбивок -------------------------------
     # markers_to_layers возвращает список с полями:
     #   name, top_md, bottom_md, thickness_md,

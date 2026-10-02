@@ -108,27 +108,35 @@ def _pick_dominant(
 
 def _build_container_type(
     n_reservoir: int,
-    dominant_form: Optional[str],
+    form_in_label: Optional[str],
     dominant_size: Optional[str],
     dominant_position: Optional[str],
     ntg: float,
+    container_state: str,
 ) -> str:
     """
-    Короткая метка типа пласта.
+    Короткая метка типа пласта (формат v3.0).
 
-    Формат:
-        no-sand                           — NTG = 0, нет коллекторов
-        single-{form}-{size}-{position}   — один интервал
-        multi-{form}-{size}-{position}    — два и более
+    Формат (docs/CLASSIFICATION_RULES_v3.md, §9.2):
+        no-sand                            — NTG = 0, нет коллекторов
+        {N}-interbedded-{size}-{position}  — переслаивание
+        {N}-{form}-{size}-{position}       — все интервалы одной формы
+        {N}-mixed-{size}-{position}        — интервалы разных форм
+
+    где N — количество интервалов (1, 2, 3, ...).
     """
-    if ntg <= 0 or n_reservoir == 0:
+    if ntg <= 0 or n_reservoir == 0 or container_state == "no-sand":
         return "no-sand"
 
-    prefix = "single" if n_reservoir == 1 else "multi"
-    form = dominant_form or "uncertain"
     size = dominant_size or "unknown"
     position = dominant_position or "unknown"
-    return f"{prefix}-{form}-{size}-{position}"
+
+    # Переслаивание — специальная метка без формы.
+    if container_state == "interbedded":
+        return f"{n_reservoir}-interbedded-{size}-{position}"
+
+    form = form_in_label or "unknown-shape"
+    return f"{n_reservoir}-{form}-{size}-{position}"
 
 
 def _build_summary(intervals: list[dict]) -> str:
@@ -185,6 +193,44 @@ def _build_intervals_json(intervals: list[dict]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _compute_container_state(
+    n_reservoir: int,
+    layer_intervals: list[dict],
+    cfg: dict,
+) -> str:
+    """
+    Определяет состояние пласта (container_state) по v3.0 §9.1.
+
+    Значения:
+        no-sand        — 0 интервалов
+        single-anomaly — 1 интервал
+        multi-anomaly  — 2..interbedded_min_count-1 интервалов
+        interbedded    — >= interbedded_min_count интервалов
+
+    Примечание о пороге 5.
+    Изначально v3.0 §9.1 предполагал ещё правило «>= половина
+    микроинтервалов < 1 м → interbedded». Оно убрано, потому что:
+      • сегментация фильтрует интервалы по MD, а мощность мы
+        считаем в TVDSS. Граничные значения (0.99–1.00 м) дают
+        ложные срабатывания;
+      • после сегментации микроинтервалов практически не остаётся;
+      • смысл «interbedded» — это много пропластков (5+), а не
+        ситуация «2 пропластка, один из них тонкий».
+
+    Параметр layer_intervals сейчас не используется, но оставлен
+    в сигнатуре: возможно, позже вернёмся к учёту микроинтервалов
+    (например, для пластов с 5+ интервалами, где это осмысленно).
+    """
+    if n_reservoir == 0:
+        return "no-sand"
+    if n_reservoir == 1:
+        return "single-anomaly"
+
+    interbedded_min = cfg.get("interbedded_min_count", 5)
+    if n_reservoir >= interbedded_min:
+        return "interbedded"
+    return "multi-anomaly"
+
 def compute_container_types(
     features_df: pd.DataFrame,
     intervals_df: pd.DataFrame,
@@ -215,6 +261,7 @@ def compute_container_types(
 
     new_cols = [
         "thickness_reservoir_tvdss", "ntg_tvdss", "n_reservoir",
+        "container_state",
         "dominant_form", "dominant_size", "dominant_position",
         "mean_confidence",
         "container_type", "container_summary", "container_intervals_json",
@@ -257,6 +304,7 @@ def compute_container_types(
 
         # Если коллекторов нет — no-sand.
         if not layer_intervals:
+            rec["container_state"] = "no-sand"
             rec["dominant_form"] = None
             rec["dominant_size"] = None
             rec["dominant_position"] = None
@@ -266,6 +314,13 @@ def compute_container_types(
             rec["container_intervals_json"] = "[]"
             rows.append(rec)
             continue
+
+        # Состояние пласта (single/multi/interbedded).
+        rec["container_state"] = _compute_container_state(
+            n_reservoir=len(layer_intervals),
+            layer_intervals=layer_intervals,
+            cfg=cfg,
+        )
 
         # Доминирующие характеристики — по мощности, при близости — по confidence.
         agg_form = _aggregate_by_key(layer_intervals, "form_type")
@@ -287,13 +342,27 @@ def compute_container_types(
                  for iv in layer_intervals]
         rec["mean_confidence"] = sum(confs) / len(confs) if confs else 0.0
 
+        # Определяем форму для метки: если все интервалы одной формы —
+        # эта форма; если разные — "mixed".
+        unique_forms = {
+            iv.get("form_type") for iv in layer_intervals
+            if iv.get("form_type") is not None
+        }
+        if len(unique_forms) == 1:
+            form_in_label = next(iter(unique_forms))
+        elif len(unique_forms) == 0:
+            form_in_label = "unknown-shape"
+        else:
+            form_in_label = "mixed"
+
         # Итоговые строки.
         rec["container_type"] = _build_container_type(
             n_reservoir=len(layer_intervals),
-            dominant_form=rec["dominant_form"],
+            form_in_label=form_in_label,
             dominant_size=rec["dominant_size"],
             dominant_position=rec["dominant_position"],
             ntg=rec["ntg_tvdss"],
+            container_state=rec["container_state"],
         )
         # Список интервалов сортируем сверху вниз по TVDSS кровли.
         sorted_ivs = sorted(

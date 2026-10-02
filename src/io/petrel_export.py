@@ -4,16 +4,18 @@
 
 Два продукта:
 
-1. LAS с FACIES и aSP — по одной кривой на скважину.
+1. LAS с FACIES, aSP и ASP_DISC — по одной кривой на скважину.
    Диапазон — весь исходный LAS. Вне пластов — NULL.
+
+   ASP_DISC — дискретный лог aSP по 5 классам Муромцева (v3.0).
+   Экспортируется, чтобы геолог видел его в Petrel рядом с aSP.
+   См. docs/CLASSIFICATION_RULES_v3.md, §10.
 
 2. Points with Attributes — по одному файлу на пласт.
    XYZ = координаты кровли из welltops. Атрибуты: Well, Layer,
    ContainerCode, Container, DominantFormCode.
 
 Плюс общий файл легенд petrel_legends.txt.
-
-См. docs/FEATURES.md, §9.
 """
 
 from __future__ import annotations
@@ -28,15 +30,18 @@ import lasio
 
 # Коды форм (совпадают с порядком в form_legend.png).
 # non_reservoir = 0. Дальше по возрастанию «шага» в правилах.
+# Коды форм v3.0. Согласованы с порядком в form_legend.py.
+# Убраны legacy v2.x: symmetric, uncertain.
 FORM_CODES = {
     "non_reservoir":    0,
     "bell":             1,
     "funnel":           2,
     "v-shape":          3,
-    "symmetric":        4,
-    "cylinder":         5,
+    "trapezoid-top":    4,
+    "trapezoid-bottom": 5,
     "trapezoid-middle": 6,
-    "uncertain":        7,
+    "cylinder":         7,
+    "unknown-shape":    8,
 }
 
 # Обратное соответствие — для легенды.
@@ -103,7 +108,9 @@ def build_facies_curve(
             code = FORM_CODES["non_reservoir"]
         else:
             form = iv.get("form_type")
-            code = FORM_CODES.get(form, FORM_CODES["uncertain"])
+            # Fallback — unknown-shape (код 8). Раньше был uncertain,
+            # но в v3.0 такой формы нет.
+            code = FORM_CODES.get(form, FORM_CODES["unknown-shape"])
         facies[mask] = float(code)
 
     return facies
@@ -135,6 +142,16 @@ def export_las_facies(
 
     facies = build_facies_curve(dataset_df, intervals_df, null_value)
 
+    facies = build_facies_curve(dataset_df, intervals_df, null_value)
+
+    # ASP_DISC — дискретный лог 0..4 (NaN → null_value).
+    # Берётся из dataset.csv как есть, ничего не пересчитываем.
+    if "aSP_disc" in dataset_df.columns:
+        asp_disc = dataset_df["aSP_disc"].to_numpy(dtype=float).copy()
+        asp_disc[np.isnan(asp_disc)] = null_value
+    else:
+        asp_disc = np.full_like(depth, null_value)
+
     # --- Формируем LAS через lasio --------------------------------
     las = lasio.LASFile()
 
@@ -150,6 +167,8 @@ def export_las_facies(
     las.append_curve("DEPT", depth, unit="m", descr="Measured depth")
     las.append_curve("aSP", asp, unit="",
                      descr="alpha-PS (0=shale, 1=sand)")
+    las.append_curve("ASP_DISC", asp_disc, unit="",
+                     descr="Discrete alpha-PS (0..4, Muromtsev classes)")
     las.append_curve("FACIES", facies, unit="",
                      descr="Electrofacies code (see legends)")
 
@@ -241,7 +260,11 @@ def export_points_by_layer(
             ctype = row["container_type"]
             ccode = container_codes.get(ctype, 0)
             form = row.get("dominant_form", None)
-            fcode = FORM_CODES.get(form, 7) if form is not None else 7
+            # Fallback — unknown-shape (код 8). Раньше здесь было
+            # жёстко 7 (uncertain), но в v3.0 такой формы нет.
+            fallback = FORM_CODES["unknown-shape"]
+            fcode = FORM_CODES.get(form, fallback) if form is not None \
+                else fallback
 
             rows.append({
                 "x": x, "y": y, "z": z,
@@ -314,6 +337,18 @@ def write_legends(
     for code in sorted(FORM_NAMES.keys()):
         lines.append(f"  {code:>2}  = {FORM_NAMES[code]}")
     lines.append(f"  --  = нет данных (NULL = -999.25)")
+    lines.append("")
+
+    lines.append("=" * 60)
+    lines.append("ASP_DISC CODES (Muromtsev 5-class)")
+    lines.append("=" * 60)
+    lines.append("")
+    lines.append("   0  = глина                (aSP <= 0.2)")
+    lines.append("   1  = алевролит глинистый  (0.2 < aSP <= 0.4)")
+    lines.append("   2  = алевролит / песчаник (0.4 < aSP <= 0.6)")
+    lines.append("   3  = песчаник среднезерн. (0.6 < aSP <= 0.8)")
+    lines.append("   4  = песчаник крупнозерн. (aSP > 0.8)")
+    lines.append("  --  = нет данных (NULL = -999.25)")
     lines.append("")
 
     lines.append("=" * 60)

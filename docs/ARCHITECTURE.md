@@ -307,3 +307,4 @@ legend → form_legend.png
 - Все хардкоды `0.4` и `5` в модулях заменены на чтение из config.
 - Убран скрытый дефолт `reservoir_cutoff=0.60` в `ClassificationParams`.
 - Исправлен баг в `_has_multiple_minima` (`<` → `>` для шкалы aSP).
+

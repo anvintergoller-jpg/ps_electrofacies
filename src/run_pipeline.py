@@ -46,7 +46,8 @@ from src.domain.container_type import compute_container_types
 from src.visualization.well_log import plot_well
 from src.visualization.form_legend import plot_form_legend
 from src.domain.cross_well_summary import build_cross_well_summary
-
+from src.domain.elements_v3 import split_interval_into_elements
+from src.domain.classify_form_v3 import classify_form_v3
 
 def print_section(text):
     """Печатает заголовок секции в рамке."""
@@ -172,6 +173,160 @@ def process_well(well_name, cfg, mnem, output_dir):
         print("  Формы:")
         for ft, cnt in res_only["form_type"].value_counts().items():
             print(f"    {ft:<17} {cnt}")
+
+    
+    # --- 7b. ПРОБНЫЙ ПРОГОН v3.0 (разбиение на элементы) ------------
+    # Только для пилота: печатаем в лог и сохраняем отдельным файлом
+    # intervals_v3.csv. Стандартный intervals.csv не трогаем.
+    # При ошибке — печатаем traceback, но не валим пайплайн.
+    print_section("ПРОБНЫЙ ПРОГОН v3.0 (разбиение на элементы)")
+
+    if "aSP_disc" not in df.columns:
+        print("  [!] Колонка aSP_disc не найдена — пропускаем.")
+        print("      Примените патч aSP_disc и перезапустите.")
+    else:
+        try:
+            from src.domain.elements_v3 import split_interval_into_elements
+
+            v3_params = cfg["classification_v3"]
+            smooth_window = cfg["preprocessing"]["smooth_window"]
+
+            depth_md_arr = df["depth_md"].to_numpy(dtype=float)
+            res_intervals = intervals_df[
+                intervals_df["kind"] == "reservoir"
+            ]
+            print(f"  Reservoir-интервалов: {len(res_intervals)}")
+
+            v3_rows = []
+            for _, iv in res_intervals.iterrows():
+                mask = (
+                    (depth_md_arr >= iv["top_md"])
+                    & (depth_md_arr <= iv["bottom_md"])
+                )
+                df_iv = df.loc[mask]
+                if df_iv.empty:
+                    continue
+
+                asp_slice = df_iv["aSP"].to_numpy(dtype=float)
+                depth_slice = df_iv["depth_tvdss"].to_numpy(dtype=float)
+                asp_disc_slice = df_iv["aSP_disc"].to_numpy(dtype=float)
+
+                elem = split_interval_into_elements(
+                    asp_slice, depth_slice, asp_disc_slice,
+                    params=v3_params,
+                    smooth_window=smooth_window,
+                )
+
+                # --- Классификация формы v3.0 ---------------------
+                form_info = classify_form_v3(elem, v3_params)
+                elem.update(form_info)
+
+                # Компактная печать одной строкой.
+                if elem["has_plateau"]:
+                    plat = (f"{elem['plateau_dominant_class']} "
+                            f"{elem['plateau_length_m']:.2f}м "
+                            f"({elem['plateau_length_frac']*100:.0f}%) "
+                            f"asp={elem['plateau_mean_asp']:.2f} "
+                            f"{elem['plateau_trend']}")
+                else:
+                    mp = elem["max_position"]
+                    plat = (f"— max@{mp:.2f}" if mp is not None else "—")
+
+                top_s = (f"{elem['top_type']} "
+                         f"{elem['top_length_m']:.2f}м "
+                         f"({elem['top_length_frac']*100:.0f}%)")
+                bot_s = (f"{elem['bot_type']} "
+                         f"{elem['bot_length_m']:.2f}м "
+                         f"({elem['bot_length_frac']*100:.0f}%)")
+
+                print(f"    {iv['layer_name']:<15} "
+                      f"[{iv['interval_index']}] "
+                      f"{iv['thickness_tvdss']:.2f}м  "
+                      f"Кр={top_s}  Пл={plat}  Пд={bot_s}  "
+                      f"n_pl={elem['n_plateaus']}  "
+                      f"→ {elem['form_type']} "
+                      f"({elem['confidence']:.2f})")
+
+                # Полная запись — в CSV.
+                v3_rows.append({
+                    "layer_name": iv["layer_name"],
+                    "interval_index": iv["interval_index"],
+                    **elem,
+                })
+
+            # Сохраняем полный результат отдельным файлом.
+            if v3_rows:
+                v3_df = pd.DataFrame(v3_rows)
+                v3_path = well_dir / "intervals_v3.csv"
+                v3_df.to_csv(v3_path, index=False, encoding="utf-8-sig")
+                print(f"  v3.0 сохранён: {v3_path.resolve()}")
+
+                # --- Подмена form_type на v3.0 -------------------
+                # Заменяем форму и confidence в intervals_df на v3.0
+                # для тех интервалов, что попали в пробный прогон.
+                # Не-резервуары и интервалы без v3 остаются как были.
+                # Это позволяет container_type.py и petrel_export.py
+                # работать с v3-формами, не меняя свой код.
+                                # Колонки, которые нужно пробросить из v3 в основной
+                # intervals_df. Формы и confidence — ключевые.
+                # Остальные — для визуализации и отчёта.
+                v3_probe_cols = [
+                    "form_type", "confidence",
+                    "symmetry_top_bot",
+                    "plateau_length_m", "plateau_mean_asp",
+                    "plateau_trend",
+                ]
+                v3_probe = v3_df[
+                    ["layer_name", "interval_index"] + v3_probe_cols
+                ].copy()
+                # Суффикс _v3, чтобы не столкнуться с существующими
+                # колонками intervals_df (в т.ч. form_type от v2).
+                rename_map = {
+                    c: f"_v3_{c}" for c in v3_probe_cols
+                }
+                v3_probe = v3_probe.rename(columns=rename_map)
+
+                intervals_df = intervals_df.merge(
+                    v3_probe,
+                    on=["layer_name", "interval_index"],
+                    how="left",
+                )
+
+                mask_v3 = intervals_df["_v3_form_type"].notna()
+
+                # Заменяем старые значения на v3 там, где они есть.
+                # form_type и confidence — прямо.
+                intervals_df.loc[mask_v3, "form_type"] = \
+                    intervals_df.loc[mask_v3, "_v3_form_type"]
+                intervals_df.loc[mask_v3, "confidence"] = \
+                    intervals_df.loc[mask_v3, "_v3_confidence"]
+
+                # Остальные колонки — создаём новые в intervals_df,
+                # если их там ещё нет.
+                for col in v3_probe_cols:
+                    if col in ("form_type", "confidence"):
+                        continue
+                    new_col = col
+                    if new_col not in intervals_df.columns:
+                        intervals_df[new_col] = None
+                    intervals_df.loc[mask_v3, new_col] = \
+                        intervals_df.loc[mask_v3, f"_v3_{col}"]
+
+                # Убираем служебные _v3_* колонки.
+                drop_cols = [
+                    f"_v3_{c}" for c in v3_probe_cols
+                    if f"_v3_{c}" in intervals_df.columns
+                ]
+                intervals_df = intervals_df.drop(columns=drop_cols)
+
+                print(f"  form_type заменён на v3.0: "
+                      f"{int(mask_v3.sum())} интервалов")
+
+        except Exception as e:
+            # Не валим пайплайн из-за пилота.
+            import traceback as _tb
+            print(f"  [!] Ошибка пробного прогона v3.0: {e}")
+            print(_tb.format_exc())
 
     # --- 8. Размер и положение --------------------------------------
     print_section("Категории размера и положение в контейнере")
